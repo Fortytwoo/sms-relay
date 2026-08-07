@@ -1,0 +1,35 @@
+services:
+  sms-relay:
+    build:
+      context: .
+    image: sms-relay:local
+    container_name: sms-relay
+    restart: unless-stopped
+    environment:
+      SMS_RELAY_API_KEY: ${SMS_RELAY_API_KEY:?SMS_RELAY_API_KEY is required}
+      SMS_RELAY_SESSION_SECRET: ${SMS_RELAY_SESSION_SECRET:?SMS_RELAY_SESSION_SECRET is required}
+      SMS_RELAY_DB_PATH: /data/sms-relay.db
+      SMS_RELAY_HOST: 0.0.0.0
+      SMS_RELAY_PORT: "8000"
+      SMS_RELAY_COOKIE_PATH: ${SMS_RELAY_COOKIE_PATH:-/sms-relay/}
+      FEISHU_APP_ID: ${FEISHU_APP_ID:?FEISHU_APP_ID is required}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:?FEISHU_APP_SECRET is required}
+      FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:?FEISHU_REDIRECT_URI is required}
+      FEISHU_CHAT_ID: ${FEISHU_CHAT_ID:-}
+      FEISHU_ALLOWED_OPEN_IDS: ${FEISHU_ALLOWED_OPEN_IDS:?FEISHU_ALLOWED_OPEN_IDS is required}
+    ports:
+      - "${SMS_RELAY_BIND_ADDRESS:-127.0.0.1}:${SMS_RELAY_BIND_PORT:-8000}:8000"
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

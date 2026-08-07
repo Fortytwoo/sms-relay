@@ -1,0 +1,12 @@
+[project]
+name = "sms-relay"
+version = "1.0.0"
+description = "A small self-hosted SMS relay with Feishu OAuth and OTP notifications"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Fortytwoo" }]
+dependencies = []
+
+[tool.uv]
+package = false
