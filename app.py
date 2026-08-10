@@ -294,6 +294,7 @@ class RelayServer(ThreadingHTTPServer):
         api_key: str,
         db_path: str,
         *,
+        read_api_key: str,
         session_secret: str | None = None,
         feishu_app_id: str = "",
         feishu_app_secret: str = "",
@@ -305,7 +306,12 @@ class RelayServer(ThreadingHTTPServer):
     ):
         if len(api_key) != 64:
             raise ValueError("SMS_RELAY_API_KEY must contain exactly 64 characters")
+        if len(read_api_key) != 64:
+            raise ValueError("SMS_RELAY_READ_API_KEY must contain exactly 64 characters")
+        if hmac.compare_digest(api_key, read_api_key):
+            raise ValueError("SMS_RELAY_READ_API_KEY must differ from SMS_RELAY_API_KEY")
         self.api_key = api_key
+        self.read_api_key = read_api_key
         self.db_path = db_path
         self.session_secret = (session_secret or api_key).encode("utf-8")
         if len(self.session_secret) < 32:
@@ -598,24 +604,24 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         return True
 
-    def api_key_is_valid(self) -> bool:
+    def api_key_is_valid(self, expected: str) -> bool:
         supplied = self.headers.get("X-API-Key", "")
         authorization = self.headers.get("Authorization", "")
         if not supplied and authorization.lower().startswith("bearer "):
             supplied = authorization[7:].strip()
-        return bool(supplied) and hmac.compare_digest(supplied, self.server.api_key)
+        return bool(supplied) and hmac.compare_digest(supplied, expected)
 
     def session_user(self) -> dict[str, Any] | None:
         return self.server.parse_session_cookie(self.headers.get("Cookie", ""))
 
     def require_read_auth(self) -> bool:
-        if self.api_key_is_valid() or self.session_user() is not None:
+        if self.api_key_is_valid(self.server.read_api_key) or self.session_user() is not None:
             return True
         self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
         return False
 
     def require_ingest_auth(self) -> bool:
-        if self.api_key_is_valid():
+        if self.api_key_is_valid(self.server.api_key):
             return True
         self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
         return False
@@ -716,11 +722,16 @@ class RelayHandler(BaseHTTPRequestHandler):
         if not self.require_read_auth():
             return
 
-        query = parse_qs(parsed.query)
+        query = parse_qs(parsed.query, keep_blank_values=True)
         try:
             limit = min(max(int(query.get("limit", ["50"])[0]), 1), 200)
             before_id = int(query.get("before_id", ["0"])[0])
+            after_id = int(query.get("after_id", ["0"])[0])
         except ValueError:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_query"})
+            return
+        incremental = "after_id" in query
+        if (incremental and "before_id" in query) or after_id < 0:
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_query"})
             return
 
@@ -731,14 +742,33 @@ class RelayHandler(BaseHTTPRequestHandler):
             FROM messages
         """
         parameters: list[Any] = []
-        if before_id > 0:
+        if incremental:
+            sql += " WHERE id > ? ORDER BY id ASC LIMIT ?"
+            parameters.extend((after_id, limit + 1))
+        elif before_id > 0:
             sql += " WHERE id < ?"
             parameters.append(before_id)
-        sql += " ORDER BY id DESC LIMIT ?"
-        parameters.append(limit)
+        if not incremental:
+            sql += " ORDER BY id DESC LIMIT ?"
+            parameters.append(limit)
 
         with open_db(self.server.db_path) as connection:
             rows = [enrich_message(dict(row)) for row in connection.execute(sql, parameters)]
+        if incremental:
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            next_after_id = int(rows[-1]["id"]) if rows else after_id
+            self.send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "count": len(rows),
+                    "messages": rows,
+                    "next_after_id": next_after_id,
+                    "has_more": has_more,
+                },
+            )
+            return
         self.send_json(HTTPStatus.OK, {"ok": True, "count": len(rows), "messages": rows})
 
     def do_POST(self) -> None:  # noqa: N802
@@ -840,6 +870,7 @@ class RelayHandler(BaseHTTPRequestHandler):
 
 def main() -> None:
     api_key = os.environ.get("SMS_RELAY_API_KEY", "")
+    read_api_key = os.environ.get("SMS_RELAY_READ_API_KEY", "")
     db_path = os.environ.get("SMS_RELAY_DB_PATH", "/data/sms-relay.db")
     host = os.environ.get("SMS_RELAY_HOST", "0.0.0.0")
     port = int(os.environ.get("SMS_RELAY_PORT", "8000"))
@@ -861,6 +892,7 @@ def main() -> None:
         (host, port),
         api_key,
         db_path,
+        read_api_key=read_api_key,
         session_secret=session_secret or api_key,
         feishu_app_id=feishu_app_id,
         feishu_app_secret=feishu_app_secret,

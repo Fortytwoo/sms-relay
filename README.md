@@ -7,7 +7,7 @@
 
 ## 功能
 
-- 64 位 API Key 鉴权接收短信，支持 `X-API-Key` 和 Bearer Header。
+- 独立的 64 位写入与只读 API Key，支持 `X-API-Key` 和 Bearer Header。
 - SQLite 持久化，并按规范化消息内容的 SHA-256 指纹去重。
 - 自动识别 4–8 位数字或字母数字验证码。
 - 飞书 OAuth 登录和 Open ID 白名单访问控制。
@@ -49,9 +49,10 @@ Windows PowerShell 使用：
 Copy-Item .env.example .env
 ```
 
-分别生成两个独立的 64 字符随机值，填入 `.env`：
+分别生成三个独立的 64 字符随机值，填入 `.env`：
 
 ```bash
+uv run python -c "import secrets; print(secrets.token_hex(32))"
 uv run python -c "import secrets; print(secrets.token_hex(32))"
 uv run python -c "import secrets; print(secrets.token_hex(32))"
 ```
@@ -61,7 +62,8 @@ uv run python -c "import secrets; print(secrets.token_hex(32))"
 | 变量 | 用途 |
 | --- | --- |
 | `SMS_RELAY_API_KEY` | Android 端写入 API 使用的 64 字符密钥 |
-| `SMS_RELAY_SESSION_SECRET` | 签名浏览器会话，必须与 API Key 不同 |
+| `SMS_RELAY_READ_API_KEY` | 外部程序读取短信使用的独立 64 字符密钥 |
+| `SMS_RELAY_SESSION_SECRET` | 签名浏览器会话，必须与两个 API Key 不同 |
 | `FEISHU_APP_ID` | 飞书自建应用 App ID |
 | `FEISHU_APP_SECRET` | 飞书自建应用 App Secret |
 | `FEISHU_REDIRECT_URI` | OAuth 回调完整 URL，例如 `https://relay.example.com/sms-relay/auth/callback` |
@@ -147,8 +149,9 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 | 方法与路径 | 鉴权 | 说明 |
 | --- | --- | --- |
 | `GET /health` | 无 | 只返回存活状态，不返回短信数量 |
-| `POST /v1/messages` | API Key | 接收一条短信 |
-| `GET /v1/messages?limit=50&before_id=123` | 飞书会话或 API Key | 按 ID 倒序分页读取短信 |
+| `POST /v1/messages` | 写入 API Key | 接收一条短信 |
+| `GET /v1/messages?limit=50&before_id=123` | 飞书会话或只读 API Key | 按 ID 倒序分页读取历史短信 |
+| `GET /v1/messages?limit=50&after_id=123` | 飞书会话或只读 API Key | 按 ID 正序获取游标之后的新短信 |
 | `GET /auth/login` | 无 | 发起飞书 OAuth |
 | `GET /auth/callback` | OAuth state | 处理飞书回调 |
 | `GET /auth/session` | 飞书会话 | 返回当前登录用户 |
@@ -164,6 +167,34 @@ curl -X POST 'https://relay.example.com/sms-relay/v1/messages' \
 ```
 
 API Key 不支持 Query String，避免密钥进入浏览器历史和代理访问日志。
+
+### 增量获取新短信
+
+客户端保存已成功处理的最后一个消息 ID，并通过 `after_id` 继续读取：
+
+```bash
+curl 'https://relay.example.com/sms-relay/v1/messages?after_id=123&limit=50' \
+  -H 'X-API-Key: <64-character-read-secret>'
+```
+
+```json
+{
+  "ok": true,
+  "count": 2,
+  "messages": [
+    {"id": 124, "sender": "10086", "content": "第一条新短信"},
+    {"id": 125, "sender": "10086", "content": "第二条新短信"}
+  ],
+  "next_after_id": 125,
+  "has_more": false
+}
+```
+
+- 返回消息按 `id` 升序排列；`after_id=0` 可从最早消息开始读取。
+- 只有整批消息处理成功后，才持久化 `next_after_id`；失败时使用原游标重试。
+- `has_more=true` 时应立即使用新的游标读取下一页；否则可按业务需要轮询。
+- 没有新短信时返回空数组，`next_after_id` 保持为请求中的 `after_id`。
+- `after_id` 与 `before_id` 不能同时使用。
 
 ## 本地开发与测试
 
@@ -187,7 +218,7 @@ nginx-location.conf          HTTPS 反向代理 location 示例
 
 ## 安全说明
 
-- 为 API Key 与 Session Secret 使用两个独立、随机生成的值。
+- 为写入 Key、只读 Key 与 Session Secret 使用三个独立、随机生成的值。
 - 只允许受信任的飞书 Open ID 登录；定期检查目标群成员。
 - 仅通过 HTTPS 暴露服务，容器端口保持绑定在 loopback。
 - 限制 `data/` 的宿主机文件权限，并制定短信保留和删除策略。

@@ -11,14 +11,20 @@ from pathlib import Path
 from app import RelayServer, extract_verification_code, parse_sim_info
 
 
-API_KEY = "a" * 64
+WRITE_API_KEY = "a" * 64
+READ_API_KEY = "b" * 64
 
 
 class RelayApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         db_path = str(Path(self.temp_dir.name) / "relay.db")
-        self.server = RelayServer(("127.0.0.1", 0), API_KEY, db_path)
+        self.server = RelayServer(
+            ("127.0.0.1", 0),
+            WRITE_API_KEY,
+            db_path,
+            read_api_key=READ_API_KEY,
+        )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.base_url = f"http://127.0.0.1:{self.server.server_port}"
@@ -101,9 +107,11 @@ class RelayApiTests(unittest.TestCase):
             "device_name": "sunstone",
             "app_version": "3.3.3.250214",
         }
-        first_status, first = self.request("POST", "/v1/messages", payload, API_KEY)
-        second_status, second = self.request("POST", "/v1/messages", payload, API_KEY)
-        list_status, listed = self.request("GET", "/v1/messages?limit=10", api_key=API_KEY)
+        first_status, first = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        second_status, second = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        list_status, listed = self.request(
+            "GET", "/v1/messages?limit=10", api_key=READ_API_KEY
+        )
 
         self.assertEqual(first_status, 200)
         self.assertFalse(first["duplicate"])
@@ -125,7 +133,7 @@ class RelayApiTests(unittest.TestCase):
             "content": "动态码：5729",
             "sim_info": "SIM1_13900000000",
         }
-        self.request("POST", "/v1/messages", payload, API_KEY)
+        self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
         cookie = self.server.make_session_cookie("ou_test", "测试用户")
 
         session_status, session = self.request("GET", "/auth/session", cookie=cookie)
@@ -154,7 +162,7 @@ class RelayApiTests(unittest.TestCase):
                 "content": "验证码：682143",
                 "sim_info": "SIM1_13900000000",
             },
-            API_KEY,
+            WRITE_API_KEY,
         )
 
         self.assertEqual(status, 200)
@@ -167,7 +175,7 @@ class RelayApiTests(unittest.TestCase):
         request = urllib.request.Request(
             self.base_url + "/v1/messages",
             data=b"hello",
-            headers={"X-API-Key": API_KEY, "Content-Type": "text/plain"},
+            headers={"X-API-Key": WRITE_API_KEY, "Content-Type": "text/plain"},
             method="POST",
         )
         with self.assertRaises(urllib.error.HTTPError) as raised:
@@ -176,7 +184,116 @@ class RelayApiTests(unittest.TestCase):
 
     def test_api_key_must_be_64_characters(self) -> None:
         with self.assertRaisesRegex(ValueError, "exactly 64"):
-            RelayServer(("127.0.0.1", 0), "too-short", ":memory:")
+            RelayServer(
+                ("127.0.0.1", 0),
+                "too-short",
+                ":memory:",
+                read_api_key=READ_API_KEY,
+            )
+
+    def test_read_api_key_must_be_64_characters_and_distinct(self) -> None:
+        with self.assertRaisesRegex(ValueError, "exactly 64"):
+            RelayServer(
+                ("127.0.0.1", 0),
+                WRITE_API_KEY,
+                ":memory:",
+                read_api_key="too-short",
+            )
+        with self.assertRaisesRegex(ValueError, "must differ"):
+            RelayServer(
+                ("127.0.0.1", 0),
+                WRITE_API_KEY,
+                ":memory:",
+                read_api_key=WRITE_API_KEY,
+            )
+
+    def test_api_keys_have_separate_read_and_write_permissions(self) -> None:
+        read_with_write_status, _ = self.request(
+            "GET", "/v1/messages", api_key=WRITE_API_KEY
+        )
+        write_with_read_status, _ = self.request(
+            "POST",
+            "/v1/messages",
+            {"from": "10086", "content": "权限测试"},
+            READ_API_KEY,
+        )
+        read_status, _ = self.request("GET", "/v1/messages", api_key=READ_API_KEY)
+
+        self.assertEqual(read_with_write_status, 401)
+        self.assertEqual(write_with_read_status, 401)
+        self.assertEqual(read_status, 200)
+
+    def test_incremental_message_cursor_is_ordered_and_resumable(self) -> None:
+        inserted_ids = []
+        for index in range(3):
+            status, body = self.request(
+                "POST",
+                "/v1/messages",
+                {"from": "10086", "content": f"增量消息 {index}"},
+                WRITE_API_KEY,
+            )
+            self.assertEqual(status, 200)
+            inserted_ids.append(body["id"])
+
+        bootstrap_status, bootstrap = self.request(
+            "GET", "/v1/messages?after_id=0&limit=10", api_key=READ_API_KEY
+        )
+        first_status, first = self.request(
+            "GET",
+            f"/v1/messages?after_id={inserted_ids[0]}&limit=1",
+            api_key=READ_API_KEY,
+        )
+        second_status, second = self.request(
+            "GET",
+            f"/v1/messages?after_id={first['next_after_id']}&limit=10",
+            api_key=READ_API_KEY,
+        )
+        empty_status, empty = self.request(
+            "GET",
+            f"/v1/messages?after_id={second['next_after_id']}&limit=10",
+            api_key=READ_API_KEY,
+        )
+
+        self.assertEqual(bootstrap_status, 200)
+        self.assertEqual(
+            [message["id"] for message in bootstrap["messages"]], inserted_ids
+        )
+        self.assertEqual(bootstrap["next_after_id"], inserted_ids[-1])
+        self.assertFalse(bootstrap["has_more"])
+        self.assertEqual(first_status, 200)
+        self.assertEqual(
+            [message["id"] for message in first["messages"]], [inserted_ids[1]]
+        )
+        self.assertEqual(first["next_after_id"], inserted_ids[1])
+        self.assertTrue(first["has_more"])
+        self.assertEqual(second_status, 200)
+        self.assertEqual(
+            [message["id"] for message in second["messages"]], [inserted_ids[2]]
+        )
+        self.assertEqual(second["next_after_id"], inserted_ids[2])
+        self.assertFalse(second["has_more"])
+        self.assertEqual(empty_status, 200)
+        self.assertEqual(empty["messages"], [])
+        self.assertEqual(empty["next_after_id"], inserted_ids[2])
+        self.assertFalse(empty["has_more"])
+
+    def test_incremental_cursor_rejects_invalid_combinations(self) -> None:
+        both_status, both = self.request(
+            "GET", "/v1/messages?before_id=10&after_id=5", api_key=READ_API_KEY
+        )
+        negative_status, negative = self.request(
+            "GET", "/v1/messages?after_id=-1", api_key=READ_API_KEY
+        )
+        blank_status, blank = self.request(
+            "GET", "/v1/messages?after_id=", api_key=READ_API_KEY
+        )
+
+        self.assertEqual(both_status, 400)
+        self.assertEqual(both["error"], "invalid_query")
+        self.assertEqual(negative_status, 400)
+        self.assertEqual(negative["error"], "invalid_query")
+        self.assertEqual(blank_status, 400)
+        self.assertEqual(blank["error"], "invalid_query")
 
 
 class MessageEnrichmentTests(unittest.TestCase):
