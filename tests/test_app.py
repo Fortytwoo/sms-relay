@@ -24,6 +24,7 @@ class RelayApiTests(unittest.TestCase):
             WRITE_API_KEY,
             db_path,
             read_api_key=READ_API_KEY,
+            allowed_open_ids={"ou_test"},
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -42,8 +43,9 @@ class RelayApiTests(unittest.TestCase):
         payload: dict[str, str] | None = None,
         api_key: str | None = None,
         cookie: str | None = None,
+        extra_headers: dict[str, str] | None = None,
     ) -> tuple[int, dict]:
-        headers: dict[str, str] = {}
+        headers: dict[str, str] = dict(extra_headers or {})
         data = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
@@ -141,8 +143,86 @@ class RelayApiTests(unittest.TestCase):
 
         self.assertEqual(session_status, 200)
         self.assertEqual(session["user"]["name"], "测试用户")
+        self.assertEqual(session["user"]["role"], "admin")
+        self.assertTrue(session["csrf_token"])
         self.assertEqual(list_status, 200)
         self.assertEqual(listed["messages"][0]["verification_code"], "5729")
+
+    def test_admin_access_api_requires_role_csrf_and_revision(self) -> None:
+        self.server.access.complete_sync(
+            [
+                {"department_id": "0", "parent_department_id": "", "name": "企业"},
+                {"department_id": "od_team", "parent_department_id": "0", "name": "测试组"},
+            ],
+            [
+                {"open_id": "ou_test", "name": "管理员"},
+                {"open_id": "ou_member", "name": "普通用户"},
+            ],
+            {("ou_test", "od_team"), ("ou_member", "od_team")},
+        )
+        admin_cookie = self.server.make_session_cookie("ou_test", "管理员")
+        session_status, session = self.request("GET", "/auth/session", cookie=admin_cookie)
+        self.assertEqual(session_status, 200)
+        csrf = session["csrf_token"]
+
+        missing_csrf_status, _ = self.request(
+            "PUT",
+            "/v1/admin/access",
+            {"revision": 0, "department_ids": [], "user_open_ids": ["ou_member"]},
+            cookie=admin_cookie,
+        )
+        save_status, saved = self.request(
+            "PUT",
+            "/v1/admin/access",
+            {"revision": 0, "department_ids": [], "user_open_ids": ["ou_member"]},
+            cookie=admin_cookie,
+            extra_headers={"X-CSRF-Token": csrf},
+        )
+        conflict_status, conflict = self.request(
+            "PUT",
+            "/v1/admin/access",
+            {"revision": 0, "department_ids": [], "user_open_ids": []},
+            cookie=admin_cookie,
+            extra_headers={"X-CSRF-Token": csrf},
+        )
+        member_cookie = self.server.make_session_cookie("ou_member", "普通用户")
+        forbidden_status, forbidden = self.request(
+            "GET", "/v1/admin/access", cookie=member_cookie
+        )
+
+        self.assertEqual(missing_csrf_status, 403)
+        self.assertEqual(save_status, 200)
+        self.assertEqual(saved["revision"], 1)
+        self.assertEqual(conflict_status, 409)
+        self.assertEqual(conflict["error"], "access_revision_conflict")
+        self.assertEqual(forbidden_status, 403)
+        self.assertEqual(forbidden["error"], "forbidden")
+
+    def test_revoked_user_session_stops_working_immediately(self) -> None:
+        self.server.access.complete_sync(
+            [{"department_id": "0", "parent_department_id": "", "name": "企业"}],
+            [{"open_id": "ou_member", "name": "普通用户"}],
+            {("ou_member", "0")},
+        )
+        self.server.access.replace_grants(
+            department_ids=[],
+            user_open_ids=["ou_member"],
+            expected_revision=0,
+            actor_open_id="ou_test",
+        )
+        cookie = self.server.make_session_cookie("ou_member", "普通用户")
+        allowed_status, _ = self.request("GET", "/v1/messages", cookie=cookie)
+        self.server.access.replace_grants(
+            department_ids=[],
+            user_open_ids=[],
+            expected_revision=1,
+            actor_open_id="ou_test",
+        )
+        revoked_status, revoked = self.request("GET", "/v1/messages", cookie=cookie)
+
+        self.assertEqual(allowed_status, 200)
+        self.assertEqual(revoked_status, 401)
+        self.assertEqual(revoked["error"], "unauthorized")
 
     def test_new_verification_message_is_sent_to_feishu_notifier(self) -> None:
         class Recorder:

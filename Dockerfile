@@ -8,6 +8,7 @@ RUN groupadd --gid 10001 smsrelay \
 
 WORKDIR /app
 COPY --chown=10001:10001 app.py /app/app.py
+COPY --chown=10001:10001 access_control.py /app/access_control.py
 COPY --chown=10001:10001 web /app/web
 
 USER 10001:10001

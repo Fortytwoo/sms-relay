@@ -6,12 +6,18 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#ffffff">
   <title>短信中转</title>
-  <link rel="stylesheet" href="assets/app.css?v=1.0.0">
+  <link rel="stylesheet" href="assets/app.css?v=1.1.0">
 </head>
 <body>
   <div class="site-shell">
     <header class="topbar">
-      <div class="brand">短信中转</div>
+      <div class="brand-group">
+        <div class="brand">短信中转</div>
+        <nav class="main-nav" id="main-nav" aria-label="主导航" hidden>
+          <button class="nav-button is-active" id="inbox-nav" type="button">收件箱</button>
+          <button class="nav-button" id="permissions-nav" type="button" hidden>权限管理</button>
+        </nav>
+      </div>
       <div class="topbar-actions" id="topbar-actions" hidden>
         <span class="signed-in-user" id="signed-in-user"></span>
         <div class="service-state" id="service-state" role="status">
@@ -41,7 +47,7 @@
         </button>
         <div class="session-note">
           <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 2.8 19 5.7v5.2c0 4.5-2.9 8.5-7 10.3-4.1-1.8-7-5.8-7-10.3V5.7l7-2.9Z"></path><path d="m9 12 2 2 4-4"></path></svg>
-          仅允许服务端白名单中的飞书账号访问
+          仅允许管理员授权的飞书账号访问
         </div>
       </section>
     </main>
@@ -153,8 +159,73 @@
         </article>
       </section>
     </main>
+
+    <main class="permissions-view" id="permissions-view" hidden>
+      <section class="permissions-shell" aria-labelledby="permissions-title">
+        <header class="permissions-header">
+          <div>
+            <p class="eyebrow">访问控制</p>
+            <h1 id="permissions-title">权限管理</h1>
+            <p>从飞书企业架构中选择部门或成员，决定谁可以登录短信页面。</p>
+          </div>
+          <button class="secondary-button" id="sync-directory" type="button">
+            <svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5"></path><path d="M6.1 9a7 7 0 0 1 11.5-2L20 9M4 15l2.4 2a7 7 0 0 0 11.5-2"></path></svg>
+            同步企业架构
+          </button>
+        </header>
+
+        <div class="directory-status" id="directory-status" role="status">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="directory-status-text">正在读取企业架构…</span>
+          <time id="directory-sync-time"></time>
+        </div>
+
+        <div class="permission-grid">
+          <section class="directory-panel" aria-labelledby="directory-title">
+            <div class="permission-panel-heading">
+              <div>
+                <h2 id="directory-title">企业架构</h2>
+                <p>勾选部门将授权其全部子部门成员</p>
+              </div>
+              <span class="count-badge" id="department-grant-count">0 个部门</span>
+            </div>
+            <label class="search-box compact-search" for="department-search">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
+              <input id="department-search" type="search" placeholder="搜索部门" autocomplete="off">
+            </label>
+            <div class="directory-tree" id="directory-tree" role="tree"></div>
+            <div class="panel-placeholder" id="directory-empty" hidden>尚未同步到部门数据</div>
+          </section>
+
+          <section class="member-panel" aria-labelledby="member-title">
+            <div class="permission-panel-heading member-heading">
+              <div>
+                <h2 id="member-title">成员</h2>
+                <p id="selected-department-label">选择左侧部门查看直属成员</p>
+              </div>
+              <span class="count-badge" id="user-grant-count">0 人单独授权</span>
+            </div>
+            <label class="search-box compact-search" for="member-search">
+              <svg aria-hidden="true" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"></circle><path d="m16 16 4 4"></path></svg>
+              <input id="member-search" type="search" placeholder="搜索当前部门成员" autocomplete="off">
+            </label>
+            <div class="member-list" id="member-list"></div>
+            <div class="panel-placeholder" id="member-empty">请选择一个部门</div>
+            <button class="load-more" id="member-load-more" type="button" hidden>加载更多成员</button>
+          </section>
+        </div>
+
+        <footer class="permission-footer">
+          <div>
+            <strong id="access-summary">尚未设置普通用户权限</strong>
+            <span>当前管理员由服务端配置保护，无法在此页面撤销。</span>
+          </div>
+          <button class="primary-button save-access-button" id="save-access" type="button">保存权限</button>
+        </footer>
+      </section>
+    </main>
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-  <script src="assets/app.js?v=1.0.0" defer></script>
+  <script src="assets/app.js?v=1.1.0" defer></script>
 </body>
 </html>

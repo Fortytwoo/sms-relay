@@ -22,6 +22,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from access_control import (
+    AccessConflictError,
+    AccessControl,
+    InvalidAccessSubjectError,
+)
+
 
 MAX_BODY_BYTES = 64 * 1024
 MAX_CONTENT_CHARS = 32 * 1024
@@ -234,29 +240,183 @@ def _json_request(
         raise RuntimeError(f"upstream_request_failed: {type(exc).__name__}") from exc
 
 
-class FeishuNotifier:
-    def __init__(self, app_id: str, app_secret: str, chat_id: str):
+class FeishuClient:
+    def __init__(self, app_id: str, app_secret: str, *, request_interval: float = 5.0):
         self.app_id = app_id
         self.app_secret = app_secret
-        self.chat_id = chat_id
+        self.request_interval = max(request_interval, 0.0)
         self._token = ""
         self._token_expires_at = 0.0
         self._lock = threading.Lock()
+        self._request_lock = threading.Lock()
+        self._last_request = 0.0
 
-    def _tenant_access_token(self) -> str:
+    def _wait_for_request_slot(self) -> None:
+        elapsed = time.monotonic() - self._last_request
+        if self._last_request and elapsed < self.request_interval:
+            time.sleep(self.request_interval - elapsed)
+
+    def _record_request(self) -> None:
+        self._last_request = time.monotonic()
+
+    def tenant_access_token(self) -> str:
         with self._lock:
             if self._token and time.time() < self._token_expires_at - 120:
                 return self._token
+            self._wait_for_request_slot()
             response = _json_request(
                 "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
                 method="POST",
                 payload={"app_id": self.app_id, "app_secret": self.app_secret},
             )
+            self._record_request()
             if response.get("code") != 0 or not response.get("tenant_access_token"):
                 raise RuntimeError(f"feishu_token_error_{response.get('code', 'unknown')}")
             self._token = str(response["tenant_access_token"])
             self._token_expires_at = time.time() + int(response.get("expire", 7200))
             return self._token
+
+    def request(
+        self,
+        path: str,
+        *,
+        method: str = "GET",
+        params: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        directory_request: bool = False,
+    ) -> dict[str, Any]:
+        with self._request_lock:
+            token = self.tenant_access_token()
+            self._wait_for_request_slot()
+            url = f"https://open.feishu.cn{path}"
+            if params:
+                url += "?" + urlencode(params)
+            response = _json_request(
+                url,
+                method=method,
+                headers={"Authorization": f"Bearer {token}"},
+                payload=payload,
+                timeout=20,
+            )
+            self._record_request()
+        if response.get("code") != 0:
+            raise RuntimeError(
+                f"feishu_api_error_{response.get('code', 'unknown')}: "
+                f"{str(response.get('msg') or 'unknown')[:240]}"
+            )
+        return response
+
+    def fetch_directory(
+        self,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[tuple[str, str]]]:
+        departments: list[dict[str, Any]] = [
+            {
+                "department_id": "0",
+                "parent_department_id": "",
+                "name": "企业",
+                "order": 0,
+                "member_count": 0,
+            }
+        ]
+        page_token = ""
+        while True:
+            params: dict[str, Any] = {
+                "department_id_type": "open_department_id",
+                "user_id_type": "open_id",
+                "page_size": 50,
+                "fetch_child": "true",
+            }
+            if page_token:
+                params["page_token"] = page_token
+            response = self.request(
+                "/open-apis/contact/v3/departments/0/children",
+                params=params,
+                directory_request=True,
+            )
+            data = response.get("data") or {}
+            for item in data.get("items") or []:
+                department_id = str(item.get("open_department_id") or "")
+                if not department_id:
+                    continue
+                departments.append(
+                    {
+                        "department_id": department_id,
+                        "parent_department_id": str(
+                            item.get("parent_department_id")
+                            or item.get("parent_open_department_id")
+                            or "0"
+                        ),
+                        "name": str(item.get("name") or "未命名部门"),
+                        "order": int(item.get("order") or 0),
+                        "member_count": int(item.get("member_count") or 0),
+                    }
+                )
+            if not data.get("has_more"):
+                break
+            page_token = str(data.get("page_token") or "")
+            if not page_token:
+                raise RuntimeError("feishu_directory_missing_page_token")
+
+        users_by_id: dict[str, dict[str, Any]] = {}
+        memberships: set[tuple[str, str]] = set()
+        for department in departments:
+            department_id = str(department["department_id"])
+            page_token = ""
+            while True:
+                params = {
+                    "department_id": department_id,
+                    "department_id_type": "open_department_id",
+                    "user_id_type": "open_id",
+                    "page_size": 50,
+                }
+                if page_token:
+                    params["page_token"] = page_token
+                response = self.request(
+                    "/open-apis/contact/v3/users/find_by_department",
+                    params=params,
+                    directory_request=True,
+                )
+                data = response.get("data") or {}
+                for item in data.get("items") or []:
+                    open_id = str(item.get("open_id") or "")
+                    if not open_id:
+                        continue
+                    status = item.get("status") or {}
+                    active = not bool(status.get("is_resigned") or status.get("is_frozen"))
+                    if "is_activated" in status:
+                        active = active and bool(status.get("is_activated"))
+                    avatar = item.get("avatar") or {}
+                    users_by_id[open_id] = {
+                        "open_id": open_id,
+                        "union_id": str(item.get("union_id") or ""),
+                        "name": str(item.get("name") or "飞书用户"),
+                        "avatar_url": str(
+                            avatar.get("avatar_72") or avatar.get("avatar_origin") or ""
+                        ),
+                        "active": active,
+                    }
+                    memberships.add((open_id, department_id))
+                    for listed_department_id in item.get("department_ids") or []:
+                        memberships.add((open_id, str(listed_department_id)))
+                if not data.get("has_more"):
+                    break
+                page_token = str(data.get("page_token") or "")
+                if not page_token:
+                    raise RuntimeError("feishu_users_missing_page_token")
+        return departments, list(users_by_id.values()), memberships
+
+
+class FeishuNotifier:
+    def __init__(
+        self,
+        app_id: str,
+        app_secret: str,
+        chat_id: str,
+        *,
+        client: FeishuClient | None = None,
+    ):
+        self.client = client or FeishuClient(app_id, app_secret)
+        self.chat_id = chat_id
 
     def send(self, message: dict[str, Any]) -> None:
         code = str(message.get("verification_code", ""))
@@ -270,10 +430,10 @@ class FeishuNotifier:
             f"接收号码：{receiver}\n"
             f"接收时间：{received_at}"
         )
-        response = _json_request(
-            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id",
+        response = self.client.request(
+            "/open-apis/im/v1/messages",
             method="POST",
-            headers={"Authorization": f"Bearer {self._tenant_access_token()}"},
+            params={"receive_id_type": "chat_id"},
             payload={
                 "receive_id": self.chat_id,
                 "msg_type": "text",
@@ -281,8 +441,6 @@ class FeishuNotifier:
                 "uuid": f"sms-relay-{message['id']}",
             },
         )
-        if response.get("code") != 0:
-            raise RuntimeError(f"feishu_message_error_{response.get('code', 'unknown')}")
 
 
 class RelayServer(ThreadingHTTPServer):
@@ -301,8 +459,11 @@ class RelayServer(ThreadingHTTPServer):
         feishu_redirect_uri: str = "",
         feishu_chat_id: str = "",
         allowed_open_ids: set[str] | None = None,
+        admin_open_ids: set[str] | None = None,
+        admin_union_ids: set[str] | None = None,
         public_cookie_path: str = "/sms-relay/",
         notifier: FeishuNotifier | None = None,
+        feishu_client: FeishuClient | None = None,
     ):
         if len(api_key) != 64:
             raise ValueError("SMS_RELAY_API_KEY must contain exactly 64 characters")
@@ -319,18 +480,34 @@ class RelayServer(ThreadingHTTPServer):
         self.feishu_app_id = feishu_app_id
         self.feishu_app_secret = feishu_app_secret
         self.feishu_redirect_uri = feishu_redirect_uri
-        self.allowed_open_ids = set(allowed_open_ids or set())
+        self.admin_open_ids = set(admin_open_ids or allowed_open_ids or set())
+        self.admin_union_ids = set(admin_union_ids or set())
         self.public_cookie_path = public_cookie_path
         self.oauth_states: dict[str, tuple[float, str]] = {}
         self.oauth_states_lock = threading.Lock()
         self.notifier = notifier
+        self.feishu_client = feishu_client
+        if self.feishu_client is None and feishu_app_id and feishu_app_secret:
+            self.feishu_client = FeishuClient(feishu_app_id, feishu_app_secret)
         if self.notifier is None and feishu_app_id and feishu_app_secret and feishu_chat_id:
-            self.notifier = FeishuNotifier(feishu_app_id, feishu_app_secret, feishu_chat_id)
+            self.notifier = FeishuNotifier(
+                feishu_app_id,
+                feishu_app_secret,
+                feishu_chat_id,
+                client=self.feishu_client,
+            )
         self.notification_lock = threading.Lock()
         self.notification_stop = threading.Event()
         self.notification_event = threading.Event()
         self.notification_thread: threading.Thread | None = None
+        self.directory_thread: threading.Thread | None = None
+        self.directory_thread_lock = threading.Lock()
         init_db(db_path)
+        self.access = AccessControl(
+            db_path,
+            admin_open_ids=self.admin_open_ids,
+            admin_union_ids=self.admin_union_ids,
+        )
         super().__init__(address, RelayHandler)
         if self.notifier is not None:
             self.notification_thread = threading.Thread(
@@ -345,10 +522,16 @@ class RelayServer(ThreadingHTTPServer):
     def oauth_is_configured(self) -> bool:
         return bool(self.feishu_app_id and self.feishu_app_secret and self.feishu_redirect_uri)
 
-    def _session_value(self, open_id: str, name: str) -> str:
+    def _session_value(self, open_id: str, name: str, union_id: str = "") -> str:
         payload = _base64url_encode(
             json.dumps(
-                {"open_id": open_id, "name": name, "exp": int(time.time()) + SESSION_SECONDS},
+                {
+                    "open_id": open_id,
+                    "union_id": union_id,
+                    "name": name,
+                    "csrf": secrets.token_urlsafe(24),
+                    "exp": int(time.time()) + SESSION_SECONDS,
+                },
                 ensure_ascii=False,
                 separators=(",", ":"),
             ).encode("utf-8")
@@ -358,12 +541,12 @@ class RelayServer(ThreadingHTTPServer):
         )
         return f"{payload}.{signature}"
 
-    def make_session_cookie(self, open_id: str, name: str) -> str:
-        return f"{SESSION_COOKIE_NAME}={self._session_value(open_id, name)}"
+    def make_session_cookie(self, open_id: str, name: str, union_id: str = "") -> str:
+        return f"{SESSION_COOKIE_NAME}={self._session_value(open_id, name, union_id)}"
 
-    def session_set_cookie(self, open_id: str, name: str) -> str:
+    def session_set_cookie(self, open_id: str, name: str, union_id: str = "") -> str:
         return (
-            f"{self.make_session_cookie(open_id, name)}; Path={self.public_cookie_path}; "
+            f"{self.make_session_cookie(open_id, name, union_id)}; Path={self.public_cookie_path}; "
             f"Max-Age={SESSION_SECONDS}; HttpOnly; Secure; SameSite=Lax"
         )
 
@@ -386,7 +569,7 @@ class RelayServer(ThreadingHTTPServer):
             data = json.loads(_base64url_decode(payload).decode("utf-8"))
             if int(data.get("exp", 0)) < int(time.time()):
                 return None
-            if not data.get("open_id"):
+            if not data.get("open_id") or not data.get("csrf"):
                 return None
             return data
         except (KeyError, ValueError, TypeError, json.JSONDecodeError):
@@ -436,6 +619,67 @@ class RelayServer(ThreadingHTTPServer):
         if response.get("code") != 0 or not isinstance(response.get("data"), dict):
             raise RuntimeError(f"feishu_user_error_{response.get('code', 'unknown')}")
         return response["data"]
+
+    def resolve_session(self, raw_cookie: str) -> dict[str, Any] | None:
+        session = self.parse_session_cookie(raw_cookie)
+        if session is None:
+            return None
+        user = self.access.resolve_user(
+            str(session.get("open_id") or ""),
+            union_id=str(session.get("union_id") or ""),
+            fallback_name=str(session.get("name") or ""),
+        )
+        if user is None:
+            return None
+        return {**user, "csrf": str(session["csrf"]), "exp": int(session["exp"])}
+
+    def start_directory_sync(self, actor_open_id: str) -> bool:
+        if self.feishu_client is None or not self.oauth_is_configured:
+            raise RuntimeError("feishu_directory_not_configured")
+        if not self.access.begin_sync():
+            return False
+
+        def run() -> None:
+            try:
+                departments, users, memberships = self.feishu_client.fetch_directory()
+                self.access.complete_sync(departments, users, memberships)
+                print(
+                    json.dumps(
+                        {
+                            "time": utc_now(),
+                            "event": "feishu_directory_sync_completed",
+                            "departments": len(departments),
+                            "users": len(users),
+                            "actor": actor_open_id,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:
+                reason = str(exc)[:512]
+                self.access.fail_sync(reason)
+                print(
+                    json.dumps(
+                        {
+                            "time": utc_now(),
+                            "event": "feishu_directory_sync_failed",
+                            "reason": reason,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        with self.directory_thread_lock:
+            self.directory_thread = threading.Thread(
+                target=run,
+                name="feishu-directory-sync",
+                daemon=True,
+            )
+            self.directory_thread.start()
+        return True
 
     def _load_message(self, row_id: int) -> dict[str, Any] | None:
         with open_db(self.db_path) as connection:
@@ -520,6 +764,8 @@ class RelayServer(ThreadingHTTPServer):
         self.notification_event.set()
         if self.notification_thread and self.notification_thread is not threading.current_thread():
             self.notification_thread.join(timeout=2)
+        if self.directory_thread and self.directory_thread is not threading.current_thread():
+            self.directory_thread.join(timeout=2)
         super().server_close()
 
 
@@ -612,7 +858,40 @@ class RelayHandler(BaseHTTPRequestHandler):
         return bool(supplied) and hmac.compare_digest(supplied, expected)
 
     def session_user(self) -> dict[str, Any] | None:
-        return self.server.parse_session_cookie(self.headers.get("Cookie", ""))
+        return self.server.resolve_session(self.headers.get("Cookie", ""))
+
+    def require_admin(self) -> dict[str, Any] | None:
+        user = self.session_user()
+        if user is None:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return None
+        if user.get("role") != "admin":
+            self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "forbidden"})
+            return None
+        return user
+
+    def require_csrf(self, user: dict[str, Any]) -> bool:
+        supplied = self.headers.get("X-CSRF-Token", "")
+        expected = str(user.get("csrf") or "")
+        if supplied and expected and hmac.compare_digest(supplied, expected):
+            return True
+        self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid_csrf_token"})
+        return False
+
+    def read_json_body(self) -> Any:
+        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+        if content_type != "application/json":
+            raise ValueError("content_type_must_be_application_json")
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise ValueError("invalid_body_size") from exc
+        if content_length <= 0 or content_length > MAX_BODY_BYTES:
+            raise ValueError("invalid_body_size")
+        try:
+            return json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid_json") from exc
 
     def require_read_auth(self) -> bool:
         if self.api_key_is_valid(self.server.read_api_key) or self.session_user() is not None:
@@ -677,14 +956,21 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "feishu_oauth_failed"})
             return
         open_id = str(user.get("open_id", ""))
-        if not self.server.allowed_open_ids or open_id not in self.server.allowed_open_ids:
+        union_id = str(user.get("union_id") or "")
+        name = str(user.get("name") or "飞书用户")[:128]
+        authorized = self.server.access.resolve_user(
+            open_id,
+            union_id=union_id,
+            fallback_name=name,
+        )
+        if authorized is None:
             self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "user_not_allowed"})
             return
-        name = str(user.get("name") or "飞书用户")[:128]
+        self.server.access.record_login(open_id, union_id, name)
         root_url = self.server.feishu_redirect_uri.rsplit("auth/callback", 1)[0]
         self.redirect(
             root_url,
-            {"Set-Cookie": self.server.session_set_cookie(open_id, name)},
+            {"Set-Cookie": self.server.session_set_cookie(open_id, name, union_id)},
         )
 
     def do_GET(self) -> None:  # noqa: N802
@@ -713,8 +999,60 @@ class RelayHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(
                     HTTPStatus.OK,
-                    {"ok": True, "user": {"open_id": user["open_id"], "name": user["name"]}},
+                    {
+                        "ok": True,
+                        "user": {
+                            "open_id": user["open_id"],
+                            "name": user["name"],
+                            "role": user["role"],
+                        },
+                        "csrf_token": user["csrf"],
+                    },
                 )
+            return
+        if parsed.path == "/v1/admin/directory":
+            user = self.require_admin()
+            if user is None:
+                return
+            snapshot = self.server.access.directory_snapshot()
+            auto_sync_started = False
+            if not snapshot["departments"] and snapshot["sync"]["status"] != "running":
+                try:
+                    auto_sync_started = self.server.start_directory_sync(str(user["open_id"]))
+                    snapshot = self.server.access.directory_snapshot()
+                except RuntimeError as exc:
+                    self.server.access.fail_sync(str(exc))
+                    snapshot = self.server.access.directory_snapshot()
+            self.send_json(
+                HTTPStatus.OK,
+                {"ok": True, **snapshot, "auto_sync_started": auto_sync_started},
+            )
+            return
+        if parsed.path == "/v1/admin/directory/users":
+            if self.require_admin() is None:
+                return
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            try:
+                limit = int(query.get("limit", ["100"])[0])
+                offset = int(query.get("offset", ["0"])[0])
+            except ValueError:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_query"})
+                return
+            result = self.server.access.list_users(
+                department_id=str(query.get("department_id", [""])[0]),
+                query=str(query.get("query", [""])[0]),
+                limit=limit,
+                offset=offset,
+            )
+            self.send_json(HTTPStatus.OK, {"ok": True, **result})
+            return
+        if parsed.path == "/v1/admin/access":
+            if self.require_admin() is None:
+                return
+            self.send_json(
+                HTTPStatus.OK,
+                {"ok": True, **self.server.access.access_summary()},
+            )
             return
         if parsed.path != "/v1/messages":
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
@@ -778,6 +1116,29 @@ class RelayHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {"ok": True},
                 {"Set-Cookie": self.server.session_clear_cookie()},
+            )
+            return
+        if parsed.path == "/v1/admin/directory/sync":
+            user = self.require_admin()
+            if user is None or not self.require_csrf(user):
+                return
+            try:
+                started = self.server.start_directory_sync(str(user["open_id"]))
+            except RuntimeError as exc:
+                self.send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": str(exc)},
+                )
+                return
+            if not started:
+                self.send_json(
+                    HTTPStatus.CONFLICT,
+                    {"ok": False, "error": "directory_sync_already_running"},
+                )
+                return
+            self.send_json(
+                HTTPStatus.ACCEPTED,
+                {"ok": True, "status": "running"},
             )
             return
         if parsed.path != "/v1/messages":
@@ -867,6 +1228,53 @@ class RelayHandler(BaseHTTPRequestHandler):
             },
         )
 
+    def do_PUT(self) -> None:  # noqa: N802
+        parsed = urlsplit(self.path)
+        if parsed.path != "/v1/admin/access":
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return
+        user = self.require_admin()
+        if user is None or not self.require_csrf(user):
+            return
+        try:
+            payload = self.read_json_body()
+            if not isinstance(payload, dict):
+                raise ValueError("JSON body must be an object")
+            department_ids = payload.get("department_ids", [])
+            user_open_ids = payload.get("user_open_ids", [])
+            revision = payload.get("revision")
+            if not isinstance(department_ids, list) or not isinstance(user_open_ids, list):
+                raise ValueError("access subjects must be arrays")
+            if isinstance(revision, bool) or not isinstance(revision, int):
+                raise ValueError("revision must be an integer")
+            result = self.server.access.replace_grants(
+                department_ids=[str(value) for value in department_ids],
+                user_open_ids=[str(value) for value in user_open_ids],
+                expected_revision=revision,
+                actor_open_id=str(user["open_id"]),
+            )
+        except AccessConflictError:
+            self.send_json(
+                HTTPStatus.CONFLICT,
+                {"ok": False, "error": "access_revision_conflict"},
+            )
+            return
+        except InvalidAccessSubjectError as exc:
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": str(exc)},
+            )
+            return
+        except ValueError as exc:
+            status = (
+                HTTPStatus.UNSUPPORTED_MEDIA_TYPE
+                if str(exc) == "content_type_must_be_application_json"
+                else HTTPStatus.BAD_REQUEST
+            )
+            self.send_json(status, {"ok": False, "error": str(exc)})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True, **result})
+
 
 def main() -> None:
     api_key = os.environ.get("SMS_RELAY_API_KEY", "")
@@ -879,13 +1287,29 @@ def main() -> None:
     feishu_app_secret = os.environ.get("FEISHU_APP_SECRET", "")
     feishu_redirect_uri = os.environ.get("FEISHU_REDIRECT_URI", "")
     feishu_chat_id = os.environ.get("FEISHU_CHAT_ID", "")
-    allowed_open_ids = {
+    legacy_allowed_open_ids = {
         value.strip()
         for value in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",")
         if value.strip()
     }
+    admin_open_ids = {
+        value.strip()
+        for value in os.environ.get("FEISHU_ADMIN_OPEN_IDS", "").split(",")
+        if value.strip()
+    } or legacy_allowed_open_ids
+    admin_union_ids = {
+        value.strip()
+        for value in os.environ.get("FEISHU_ADMIN_UNION_IDS", "").split(",")
+        if value.strip()
+    }
     if any((feishu_app_id, feishu_app_secret, feishu_redirect_uri)) and not all(
-        (feishu_app_id, feishu_app_secret, feishu_redirect_uri, session_secret, allowed_open_ids)
+        (
+            feishu_app_id,
+            feishu_app_secret,
+            feishu_redirect_uri,
+            session_secret,
+            admin_open_ids or admin_union_ids,
+        )
     ):
         raise ValueError("Feishu OAuth configuration is incomplete")
     server = RelayServer(
@@ -898,7 +1322,8 @@ def main() -> None:
         feishu_app_secret=feishu_app_secret,
         feishu_redirect_uri=feishu_redirect_uri,
         feishu_chat_id=feishu_chat_id,
-        allowed_open_ids=allowed_open_ids,
+        admin_open_ids=admin_open_ids,
+        admin_union_ids=admin_union_ids,
         public_cookie_path=os.environ.get("SMS_RELAY_COOKIE_PATH", "/sms-relay/"),
     )
     print(
@@ -910,6 +1335,7 @@ def main() -> None:
                 "db_path": db_path,
                 "feishu_oauth": server.oauth_is_configured,
                 "feishu_push": server.notifier is not None,
+                "configured_admins": len(admin_open_ids) + len(admin_union_ids),
             }
         ),
         flush=True,

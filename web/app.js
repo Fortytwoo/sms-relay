@@ -5,16 +5,33 @@ const REFRESH_INTERVAL_MS = 15000;
 
 const state = {
   user: null,
+  csrfToken: "",
   messages: [],
   selectedId: null,
   hasMore: false,
   loading: false,
   refreshTimer: null,
+  directory: [],
+  directoryRevision: 0,
+  accessRevision: 0,
+  selectedDepartmentId: "",
+  departmentGrants: new Set(),
+  userGrants: new Set(),
+  members: [],
+  memberOffset: 0,
+  memberHasMore: false,
+  adminLoaded: false,
+  adminLoading: false,
+  syncTimer: null,
 };
 
 const elements = {
   loginView: document.querySelector("#login-view"),
   inboxView: document.querySelector("#inbox-view"),
+  permissionsView: document.querySelector("#permissions-view"),
+  mainNav: document.querySelector("#main-nav"),
+  inboxNav: document.querySelector("#inbox-nav"),
+  permissionsNav: document.querySelector("#permissions-nav"),
   topbarActions: document.querySelector("#topbar-actions"),
   signedInUser: document.querySelector("#signed-in-user"),
   feishuLogin: document.querySelector("#feishu-login"),
@@ -42,6 +59,23 @@ const elements = {
   serviceState: document.querySelector("#service-state"),
   serviceStateText: document.querySelector("#service-state-text"),
   toast: document.querySelector("#toast"),
+  syncDirectory: document.querySelector("#sync-directory"),
+  directoryStatus: document.querySelector("#directory-status"),
+  directoryStatusText: document.querySelector("#directory-status-text"),
+  directorySyncTime: document.querySelector("#directory-sync-time"),
+  departmentSearch: document.querySelector("#department-search"),
+  directoryTree: document.querySelector("#directory-tree"),
+  directoryEmpty: document.querySelector("#directory-empty"),
+  departmentGrantCount: document.querySelector("#department-grant-count"),
+  memberTitle: document.querySelector("#member-title"),
+  selectedDepartmentLabel: document.querySelector("#selected-department-label"),
+  userGrantCount: document.querySelector("#user-grant-count"),
+  memberSearch: document.querySelector("#member-search"),
+  memberList: document.querySelector("#member-list"),
+  memberEmpty: document.querySelector("#member-empty"),
+  memberLoadMore: document.querySelector("#member-load-more"),
+  accessSummary: document.querySelector("#access-summary"),
+  saveAccess: document.querySelector("#save-access"),
 };
 
 function relativeUrl(path) {
@@ -102,11 +136,15 @@ function showToast(message) {
 
 function showLogin(message = "") {
   stopAutoRefresh();
+  stopDirectoryPolling();
   state.user = null;
+  state.csrfToken = "";
   state.messages = [];
   state.selectedId = null;
   document.body.classList.remove("detail-open");
   elements.inboxView.hidden = true;
+  elements.permissionsView.hidden = true;
+  elements.mainNav.hidden = true;
   elements.topbarActions.hidden = true;
   elements.loginView.hidden = false;
   setLoginLoading(false);
@@ -118,9 +156,28 @@ function showInbox(user) {
   state.user = user;
   elements.signedInUser.textContent = user.name || "飞书用户";
   elements.loginView.hidden = true;
-  elements.inboxView.hidden = false;
+  elements.mainNav.hidden = false;
+  elements.permissionsNav.hidden = user.role !== "admin";
   elements.topbarActions.hidden = false;
-  startAutoRefresh();
+  switchView(window.location.hash === "#permissions" ? "permissions" : "inbox");
+}
+
+function switchView(view) {
+  const permissionsAllowed = view === "permissions" && state.user?.role === "admin";
+  elements.inboxView.hidden = permissionsAllowed;
+  elements.permissionsView.hidden = !permissionsAllowed;
+  elements.inboxNav.classList.toggle("is-active", !permissionsAllowed);
+  elements.permissionsNav.classList.toggle("is-active", permissionsAllowed);
+  if (permissionsAllowed) {
+    stopAutoRefresh();
+    if (window.location.hash !== "#permissions") window.history.replaceState({}, "", "#permissions");
+    loadAdminData();
+  } else {
+    stopDirectoryPolling();
+    if (window.location.hash) window.history.replaceState({}, "", window.location.pathname);
+    startAutoRefresh();
+    if (!state.messages.length) fetchMessages();
+  }
 }
 
 function normalizeDate(value) {
@@ -250,6 +307,326 @@ function render() {
   renderDetail();
 }
 
+function stopDirectoryPolling() {
+  if (state.syncTimer) window.clearTimeout(state.syncTimer);
+  state.syncTimer = null;
+}
+
+function departmentById(id) {
+  return state.directory.find((item) => item.department_id === id) || null;
+}
+
+function isDepartmentCovered(id, includeSelf = true) {
+  let current = includeSelf ? id : departmentById(id)?.parent_department_id;
+  const visited = new Set();
+  while (current && !visited.has(current)) {
+    if (state.departmentGrants.has(current)) return true;
+    visited.add(current);
+    current = departmentById(current)?.parent_department_id || "";
+  }
+  return false;
+}
+
+function isDescendantOf(id, parentId) {
+  let current = departmentById(id)?.parent_department_id || "";
+  const visited = new Set();
+  while (current && !visited.has(current)) {
+    if (current === parentId) return true;
+    visited.add(current);
+    current = departmentById(current)?.parent_department_id || "";
+  }
+  return false;
+}
+
+function renderAccessSummary(effectiveCount = null) {
+  elements.departmentGrantCount.textContent = `${state.departmentGrants.size} 个部门`;
+  elements.userGrantCount.textContent = `${state.userGrants.size} 人单独授权`;
+  const grants = `${state.departmentGrants.size} 个部门 + ${state.userGrants.size} 名成员`;
+  elements.accessSummary.textContent = effectiveCount === null
+    ? `待保存：${grants}`
+    : `已授权 ${effectiveCount} 名普通用户（${grants}）`;
+}
+
+function buildDepartmentRow(department, depth) {
+  const row = document.createElement("div");
+  row.className = "directory-row";
+  row.setAttribute("role", "treeitem");
+  row.setAttribute("aria-level", String(depth + 1));
+  if (department.department_id === state.selectedDepartmentId) row.classList.add("is-selected");
+  row.style.setProperty("--tree-depth", String(depth));
+
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.className = "permission-checkbox";
+  const inherited = isDepartmentCovered(department.department_id, false);
+  checkbox.checked = inherited || state.departmentGrants.has(department.department_id);
+  checkbox.disabled = inherited;
+  checkbox.setAttribute("aria-label", `授权部门 ${department.name}`);
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) {
+      state.departmentGrants.add(department.department_id);
+      for (const existing of [...state.departmentGrants]) {
+        if (existing !== department.department_id && isDescendantOf(existing, department.department_id)) {
+          state.departmentGrants.delete(existing);
+        }
+      }
+    } else {
+      state.departmentGrants.delete(department.department_id);
+    }
+    renderDirectoryTree();
+    renderMembers();
+    renderAccessSummary();
+  });
+
+  const select = document.createElement("button");
+  select.type = "button";
+  select.className = "directory-name";
+  select.textContent = department.name;
+  select.addEventListener("click", () => selectDepartment(department.department_id));
+
+  const count = document.createElement("span");
+  count.className = "directory-member-count";
+  count.textContent = String(department.member_count || 0);
+  if (inherited) {
+    const inheritedBadge = document.createElement("span");
+    inheritedBadge.className = "inherited-badge";
+    inheritedBadge.textContent = "已继承";
+    row.append(checkbox, select, inheritedBadge, count);
+  } else {
+    row.append(checkbox, select, count);
+  }
+  return row;
+}
+
+function renderDirectoryTree() {
+  const query = elements.departmentSearch.value.trim().toLocaleLowerCase("zh-CN");
+  const children = new Map();
+  for (const item of state.directory) {
+    const parent = item.parent_department_id || "";
+    if (!children.has(parent)) children.set(parent, []);
+    children.get(parent).push(item);
+  }
+  for (const items of children.values()) {
+    items.sort((a, b) => (a.sort_order - b.sort_order) || a.name.localeCompare(b.name, "zh-CN"));
+  }
+  const nodes = [];
+  if (query) {
+    for (const item of state.directory.filter((entry) => entry.name.toLocaleLowerCase("zh-CN").includes(query))) {
+      nodes.push(buildDepartmentRow(item, 0));
+    }
+  } else {
+    const visit = (item, depth, seen) => {
+      if (seen.has(item.department_id)) return;
+      const nextSeen = new Set(seen);
+      nextSeen.add(item.department_id);
+      nodes.push(buildDepartmentRow(item, depth));
+      for (const child of children.get(item.department_id) || []) visit(child, depth + 1, nextSeen);
+    };
+    const roots = children.get("") || state.directory.filter((item) => !departmentById(item.parent_department_id));
+    for (const root of roots) visit(root, 0, new Set());
+  }
+  elements.directoryTree.replaceChildren(...nodes);
+  elements.directoryTree.hidden = nodes.length === 0;
+  elements.directoryEmpty.hidden = nodes.length !== 0;
+}
+
+function buildMemberRow(user) {
+  const row = document.createElement("label");
+  row.className = "member-row";
+  const inherited = user.is_admin || user.department_ids.some((id) => isDepartmentCovered(id));
+  const checkbox = document.createElement("input");
+  checkbox.type = "checkbox";
+  checkbox.className = "permission-checkbox";
+  checkbox.checked = inherited || state.userGrants.has(user.open_id);
+  checkbox.disabled = inherited;
+  checkbox.addEventListener("change", () => {
+    if (checkbox.checked) state.userGrants.add(user.open_id);
+    else state.userGrants.delete(user.open_id);
+    renderAccessSummary();
+  });
+  const avatar = document.createElement("span");
+  avatar.className = "member-avatar";
+  avatar.textContent = (user.name || "飞").slice(0, 1);
+  const identity = document.createElement("span");
+  identity.className = "member-identity";
+  const name = document.createElement("strong");
+  name.textContent = user.name || "飞书用户";
+  const hint = document.createElement("span");
+  hint.textContent = user.is_admin ? "管理员 · 服务端保护" : inherited ? "由部门授权" : "可单独授权";
+  identity.append(name, hint);
+  row.append(checkbox, avatar, identity);
+  return row;
+}
+
+function renderMembers() {
+  const nodes = state.members.map(buildMemberRow);
+  elements.memberList.replaceChildren(...nodes);
+  elements.memberList.hidden = nodes.length === 0;
+  elements.memberEmpty.hidden = nodes.length !== 0;
+  if (!nodes.length) {
+    elements.memberEmpty.textContent = state.selectedDepartmentId ? "当前部门没有匹配成员" : "请选择一个部门";
+  }
+  elements.memberLoadMore.hidden = !state.memberHasMore;
+}
+
+async function fetchMembers({ append = false } = {}) {
+  if (!state.selectedDepartmentId) {
+    state.members = [];
+    renderMembers();
+    return;
+  }
+  const offset = append ? state.memberOffset : 0;
+  const url = relativeUrl("v1/admin/directory/users");
+  url.searchParams.set("department_id", state.selectedDepartmentId);
+  url.searchParams.set("query", elements.memberSearch.value.trim());
+  url.searchParams.set("limit", "100");
+  url.searchParams.set("offset", String(offset));
+  try {
+    const response = await fetch(url, { cache: "no-store" });
+    if (response.status === 401) throw new Error("unauthorized");
+    if (response.status === 403) throw new Error("forbidden");
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    const payload = await response.json();
+    state.members = append ? [...state.members, ...(payload.users || [])] : (payload.users || []);
+    state.memberOffset = offset + (payload.users || []).length;
+    state.memberHasMore = Boolean(payload.has_more);
+    renderMembers();
+  } catch (error) {
+    if (error.message === "unauthorized") showLogin("登录已过期，请重新使用飞书登录");
+    else if (error.message === "forbidden") switchView("inbox");
+    else showToast("读取成员失败，请稍后重试");
+  }
+}
+
+function selectDepartment(id) {
+  state.selectedDepartmentId = id;
+  const department = departmentById(id);
+  elements.memberTitle.textContent = department?.name || "成员";
+  elements.selectedDepartmentLabel.textContent = "直属成员；部门授权同时覆盖全部子部门";
+  elements.memberSearch.value = "";
+  state.members = [];
+  state.memberOffset = 0;
+  renderDirectoryTree();
+  fetchMembers();
+}
+
+function renderSyncStatus(sync) {
+  const status = sync?.status || "idle";
+  elements.directoryStatus.classList.toggle("is-running", status === "running");
+  elements.directoryStatus.classList.toggle("is-error", status === "failed");
+  elements.syncDirectory.disabled = status === "running";
+  elements.syncDirectory.classList.toggle("is-loading", status === "running");
+  if (status === "running") elements.directoryStatusText.textContent = "正在从飞书同步企业架构，部门较多时可能需要数分钟";
+  else if (status === "failed") elements.directoryStatusText.textContent = `同步失败：${sync.error || "未知错误"}`;
+  else if (status === "success") elements.directoryStatusText.textContent = "企业架构同步完成";
+  else elements.directoryStatusText.textContent = "尚未同步企业架构";
+  elements.directorySyncTime.textContent = sync?.finished_at ? `最近完成 ${fullDate(sync.finished_at)}` : "";
+  stopDirectoryPolling();
+  if (status === "running" && !elements.permissionsView.hidden) {
+    state.syncTimer = window.setTimeout(() => refreshDirectory(), 5000);
+  }
+}
+
+async function refreshDirectory() {
+  try {
+    const response = await fetch(relativeUrl("v1/admin/directory"), { cache: "no-store" });
+    if (response.status === 401) throw new Error("unauthorized");
+    if (response.status === 403) throw new Error("forbidden");
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    const payload = await response.json();
+    const changed = state.directoryRevision !== Number(payload.directory_revision || 0);
+    state.directory = Array.isArray(payload.departments) ? payload.departments : [];
+    state.directoryRevision = Number(payload.directory_revision || 0);
+    renderSyncStatus(payload.sync);
+    renderDirectoryTree();
+    if (!state.selectedDepartmentId && state.directory.length) selectDepartment(state.directory[0].department_id);
+    else if (changed && state.selectedDepartmentId) fetchMembers();
+    return payload;
+  } catch (error) {
+    if (error.message === "unauthorized") showLogin("登录已过期，请重新使用飞书登录");
+    else if (error.message === "forbidden") switchView("inbox");
+    else showToast("读取企业架构失败");
+    return null;
+  }
+}
+
+async function loadAdminData() {
+  if (state.adminLoading) return;
+  state.adminLoading = true;
+  try {
+    const directory = await refreshDirectory();
+    if (!directory) return;
+    const response = await fetch(relativeUrl("v1/admin/access"), { cache: "no-store" });
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    const access = await response.json();
+    state.accessRevision = Number(access.revision || 0);
+    state.departmentGrants = new Set(access.department_ids || []);
+    state.userGrants = new Set(access.user_open_ids || []);
+    state.adminLoaded = true;
+    renderDirectoryTree();
+    renderMembers();
+    renderAccessSummary(Number(access.effective_user_count || 0));
+  } catch {
+    showToast("读取权限配置失败");
+  } finally {
+    state.adminLoading = false;
+  }
+}
+
+async function startDirectorySync() {
+  elements.syncDirectory.disabled = true;
+  try {
+    const response = await fetch(relativeUrl("v1/admin/directory/sync"), {
+      method: "POST",
+      headers: { "X-CSRF-Token": state.csrfToken },
+    });
+    if (response.status !== 202 && response.status !== 409) throw new Error(`http_${response.status}`);
+    await refreshDirectory();
+  } catch {
+    elements.syncDirectory.disabled = false;
+    showToast("启动同步失败，请稍后重试");
+  }
+}
+
+async function saveAccess() {
+  elements.saveAccess.disabled = true;
+  elements.saveAccess.classList.add("is-loading");
+  try {
+    const response = await fetch(relativeUrl("v1/admin/access"), {
+      method: "PUT",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": state.csrfToken,
+      },
+      body: JSON.stringify({
+        revision: state.accessRevision,
+        department_ids: [...state.departmentGrants],
+        user_open_ids: [...state.userGrants],
+      }),
+    });
+    if (response.status === 409) {
+      showToast("权限已被其他页面更新，正在重新加载");
+      state.adminLoaded = false;
+      await loadAdminData();
+      return;
+    }
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    const payload = await response.json();
+    state.accessRevision = Number(payload.revision || 0);
+    state.departmentGrants = new Set(payload.department_ids || []);
+    state.userGrants = new Set(payload.user_open_ids || []);
+    renderDirectoryTree();
+    renderMembers();
+    renderAccessSummary(Number(payload.effective_user_count || 0));
+    showToast("权限已保存");
+  } catch {
+    showToast("保存权限失败，请稍后重试");
+  } finally {
+    elements.saveAccess.disabled = false;
+    elements.saveAccess.classList.remove("is-loading");
+  }
+}
+
 async function copyText(value, successMessage) {
   try {
     if (navigator.clipboard && window.isSecureContext) {
@@ -314,7 +691,7 @@ async function checkSession() {
     const response = await fetch(relativeUrl("auth/session"), { cache: "no-store" });
     if (!response.ok) return null;
     const payload = await response.json();
-    return payload.user || null;
+    return payload.user ? payload : null;
   } catch {
     return null;
   }
@@ -344,6 +721,8 @@ elements.logoutButton.addEventListener("click", async () => {
     showLogin();
   }
 });
+elements.inboxNav.addEventListener("click", () => switchView("inbox"));
+elements.permissionsNav.addEventListener("click", () => switchView("permissions"));
 elements.refreshButton.addEventListener("click", () => fetchMessages());
 elements.autoRefresh.addEventListener("change", startAutoRefresh);
 elements.searchInput.addEventListener("input", render);
@@ -357,16 +736,28 @@ elements.copySender.addEventListener("click", () =>
   copyText(elements.detailSender.textContent, "号码已复制"));
 elements.detailCode.addEventListener("click", () =>
   copyText(elements.detailCode.textContent, "验证码已复制"));
+elements.syncDirectory.addEventListener("click", startDirectorySync);
+elements.saveAccess.addEventListener("click", saveAccess);
+elements.departmentSearch.addEventListener("input", renderDirectoryTree);
+elements.memberLoadMore.addEventListener("click", () => fetchMembers({ append: true }));
+elements.memberSearch.addEventListener("input", () => {
+  window.clearTimeout(elements.memberSearch.timer);
+  elements.memberSearch.timer = window.setTimeout(() => fetchMembers(), 320);
+});
+window.addEventListener("hashchange", () => {
+  if (!state.user) return;
+  switchView(window.location.hash === "#permissions" ? "permissions" : "inbox");
+});
 
 window.addEventListener("pageshow", async () => {
   const query = new URLSearchParams(window.location.search);
   const loginError = query.get("login_error") ? "飞书授权未完成，请重试" : "";
   if (query.has("login_error")) window.history.replaceState({}, "", window.location.pathname);
-  const user = await checkSession();
-  if (!user) {
+  const session = await checkSession();
+  if (!session) {
     showLogin(loginError);
     return;
   }
-  showInbox(user);
-  await fetchMessages();
+  state.csrfToken = session.csrf_token || "";
+  showInbox(session.user);
 }, { once: true });

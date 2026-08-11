@@ -17,7 +17,10 @@ services:
       FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:?FEISHU_APP_SECRET is required}
       FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:?FEISHU_REDIRECT_URI is required}
       FEISHU_CHAT_ID: ${FEISHU_CHAT_ID:-}
-      FEISHU_ALLOWED_OPEN_IDS: ${FEISHU_ALLOWED_OPEN_IDS:?FEISHU_ALLOWED_OPEN_IDS is required}
+      FEISHU_ADMIN_OPEN_IDS: ${FEISHU_ADMIN_OPEN_IDS:-}
+      FEISHU_ADMIN_UNION_IDS: ${FEISHU_ADMIN_UNION_IDS:-}
+      # Backward-compatible bootstrap source; migrate existing deployments gradually.
+      FEISHU_ALLOWED_OPEN_IDS: ${FEISHU_ALLOWED_OPEN_IDS:-}
     ports:
       - "${SMS_RELAY_BIND_ADDRESS:-127.0.0.1}:${SMS_RELAY_BIND_PORT:-8000}:8000"
     volumes:

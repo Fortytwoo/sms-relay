@@ -10,7 +10,8 @@
 - 独立的 64 位写入与只读 API Key，支持 `X-API-Key` 和 Bearer Header。
 - SQLite 持久化，并按规范化消息内容的 SHA-256 指纹去重。
 - 自动识别 4–8 位数字或字母数字验证码。
-- 飞书 OAuth 登录和 Open ID 白名单访问控制。
+- 飞书 OAuth 登录、管理员与 SQLite 动态访问控制。
+- 从飞书只读同步企业组织架构，支持部门（含全部子部门）和个人授权。
 - 验证码点击复制，显示接收短信的 SIM 卡槽和手机号。
 - 可选的飞书群验证码通知，失败后后台重试。
 - 响应式中文网页，支持搜索、分页和自动刷新。
@@ -67,7 +68,9 @@ uv run python -c "import secrets; print(secrets.token_hex(32))"
 | `FEISHU_APP_ID` | 飞书自建应用 App ID |
 | `FEISHU_APP_SECRET` | 飞书自建应用 App Secret |
 | `FEISHU_REDIRECT_URI` | OAuth 回调完整 URL，例如 `https://relay.example.com/sms-relay/auth/callback` |
-| `FEISHU_ALLOWED_OPEN_IDS` | 允许登录的 Open ID，多个值使用英文逗号分隔 |
+| `FEISHU_ADMIN_OPEN_IDS` | 不可在页面撤销的管理员 Open ID，多个值使用英文逗号分隔 |
+| `FEISHU_ADMIN_UNION_IDS` | 可选；管理员 Union ID，适合跨应用身份审计 |
+| `FEISHU_ALLOWED_OPEN_IDS` | 旧版兼容变量；新部署请留空并使用管理员变量 |
 | `FEISHU_CHAT_ID` | 可选；接收验证码通知的群 Chat ID |
 
 ### 2. 配置飞书应用
@@ -75,9 +78,11 @@ uv run python -c "import secrets; print(secrets.token_hex(32))"
 在飞书开放平台创建企业自建应用：
 
 1. 启用网页 OAuth 登录能力，并把 `FEISHU_REDIRECT_URI` 加入安全重定向 URL。
-2. 开通读取当前登录用户基本信息所需的权限。
+2. 开通读取当前登录用户基本信息、通讯录基本信息和部门组织架构所需权限，并把应用通讯录权限范围设为“全部成员”。
 3. 如需群通知，启用机器人和发送群消息权限，把机器人加入目标群，再填写群 Chat ID。
-4. 把允许访问收件箱的用户 Open ID 写入 `FEISHU_ALLOWED_OPEN_IDS`。空白名单会拒绝所有用户。
+4. 把初始管理员写入 `FEISHU_ADMIN_OPEN_IDS`。管理员首次进入“权限管理”时会自动启动组织架构同步。
+
+普通用户不再写入环境变量。管理员可在页面勾选部门或人员；部门授权会递归包含全部子部门，并在下一次目录同步完成后自动跟随入职、调岗和离职变化。同步采用新快照事务替换，失败时保留最近一次成功目录。
 
 飞书 App Secret、用户 Open ID 和群 Chat ID 均不要提交到仓库。
 
@@ -156,6 +161,11 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 | `GET /auth/callback` | OAuth state | 处理飞书回调 |
 | `GET /auth/session` | 飞书会话 | 返回当前登录用户 |
 | `POST /auth/logout` | 无 | 清除当前浏览器会话 |
+| `GET /v1/admin/directory` | 管理员会话 | 返回本地企业架构和同步状态 |
+| `GET /v1/admin/directory/users` | 管理员会话 | 按部门或姓名分页查询成员 |
+| `POST /v1/admin/directory/sync` | 管理员会话 + CSRF | 后台同步飞书企业架构 |
+| `GET /v1/admin/access` | 管理员会话 | 返回当前部门与个人授权 |
+| `PUT /v1/admin/access` | 管理员会话 + CSRF | 使用版本号原子更新授权 |
 
 写入示例：
 
@@ -209,6 +219,7 @@ node --check web/app.js
 
 ```text
 app.py                       HTTP API、OAuth、SQLite 与飞书通知
+access_control.py            企业目录快照、授权规则与审计
 web/                         无构建步骤的网页收件箱
 tests/                       标准库 unittest 测试
 configure_smsforwarder.py    SmsForwarder 数据库配置辅助脚本
@@ -219,7 +230,8 @@ nginx-location.conf          HTTPS 反向代理 location 示例
 ## 安全说明
 
 - 为写入 Key、只读 Key 与 Session Secret 使用三个独立、随机生成的值。
-- 只允许受信任的飞书 Open ID 登录；定期检查目标群成员。
+- 只配置受信任的飞书管理员，并定期检查页面授权和目标群成员。
+- 权限写入使用 CSRF token 与乐观版本控制；每次浏览器请求都会重新校验当前权限，撤权后旧会话立即失效。
 - 仅通过 HTTPS 暴露服务，容器端口保持绑定在 loopback。
 - 限制 `data/` 的宿主机文件权限，并制定短信保留和删除策略。
 - 发现凭据误提交时，删除文件并不足够，必须立即轮换对应凭据。
