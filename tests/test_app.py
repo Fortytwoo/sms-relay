@@ -10,6 +10,7 @@ import urllib.request
 from pathlib import Path
 
 from app import (
+    FeishuNotifier,
     RelayServer,
     extract_message_tag,
     extract_verification_code,
@@ -473,6 +474,9 @@ class MessageEnrichmentTests(unittest.TestCase):
     def test_extracts_common_verification_code_formats(self) -> None:
         cases = {
             "验证码是123456，请勿泄露": "123456",
+            "【丁香园】您的丁香园账号登录验证码 482701，请勿泄露。": "482701",
+            "【快手科技】739205快手验证码，15分钟内有效，仅用于登录。": "739205",
+            "【抖音商城】订单导出文件已加密，解压密码为618204，请妥善保管": "618204",
             "动态码：4827，10分钟内有效": "4827",
             "Your OTP is A7C91D": "A7C91D",
             "839204 是您的校验码": "839204",
@@ -484,11 +488,46 @@ class MessageEnrichmentTests(unittest.TestCase):
 
     def test_does_not_treat_unrelated_numbers_as_verification_codes(self) -> None:
         self.assertEqual(extract_verification_code("订单 202608071234 已发货"), "")
+        self.assertEqual(
+            extract_verification_code("您的抖店账号于2026-08-10 12:10:00成功登录"),
+            "",
+        )
+        self.assertEqual(extract_verification_code("解锁最高1000流量包"), "")
+        self.assertEqual(extract_verification_code("您的登录密码已修改"), "")
 
     def test_parses_sim_slot_and_phone_number(self) -> None:
         self.assertEqual(parse_sim_info("SIM2_13800000000"), ("SIM2", "13800000000"))
         self.assertEqual(parse_sim_info("卡1 中国联通 13900000000"), ("SIM1", "13900000000"))
         self.assertEqual(parse_sim_info("SIM2_"), ("SIM2", ""))
+
+
+class FeishuNotifierTests(unittest.TestCase):
+    def test_notification_includes_tag_only_when_present(self) -> None:
+        class RecorderClient:
+            def __init__(self) -> None:
+                self.payloads: list[dict] = []
+
+            def request(self, _path: str, **kwargs) -> dict:
+                self.payloads.append(kwargs["payload"])
+                return {"code": 0}
+
+        client = RecorderClient()
+        notifier = FeishuNotifier("", "", "oc_test", client=client)
+        base_message = {
+            "id": 1,
+            "verification_code": "482701",
+            "sender": "10690000",
+            "sim_phone": "13800000000",
+            "source_received_at": "2026-08-12 10:00:00",
+        }
+
+        notifier.send({**base_message, "tag": "小红书"})
+        notifier.send({**base_message, "id": 2, "tag": ""})
+
+        tagged_text = json.loads(client.payloads[0]["content"])["text"]
+        untagged_text = json.loads(client.payloads[1]["content"])["text"]
+        self.assertIn("平台：小红书", tagged_text)
+        self.assertNotIn("平台：", untagged_text)
 
 
 if __name__ == "__main__":

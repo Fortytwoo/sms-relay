@@ -48,16 +48,16 @@ _CODE_TOKEN = (
     r"(?![A-Z0-9])"
 )
 _CODE_KEYWORD = (
-    r"(?:验证码|校验码|动态码|短信码|一次性密码|"
+    r"(?:验证码|校验码|动态码|短信码|一次性密码|解压密码|"
     r"verification\s*code|security\s*code|one[-\s]*time\s*password|otp)"
 )
 _CODE_PATTERNS = (
     re.compile(
-        rf"{_CODE_KEYWORD}(?:\s*(?:是|为|为您|is|[:：=,，-])\s*){{0,3}}{_CODE_TOKEN}",
+        rf"{_CODE_KEYWORD}\s*(?:(?:是|为|为您|is|[:：=,，-])\s*){{0,3}}{_CODE_TOKEN}",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"{_CODE_TOKEN}\s*(?:是|为|is)?\s*(?:您的|本次|your)?\s*{_CODE_KEYWORD}",
+        rf"{_CODE_TOKEN}\s*(?:是|为|is)?\s*(?:您的|本次|your)?\s*(?:快手)?\s*{_CODE_KEYWORD}",
         re.IGNORECASE,
     ),
 )
@@ -454,12 +454,18 @@ class FeishuNotifier:
             return
         receiver = str(message.get("sim_phone") or message.get("sim_slot") or "未知")
         received_at = str(message.get("source_received_at") or message.get("received_at") or "未知")
-        text = (
-            f"验证码：{code}\n"
-            f"来源：{message.get('sender') or '未知'}\n"
-            f"接收号码：{receiver}\n"
-            f"接收时间：{received_at}"
+        tag = str(message.get("tag") or "").strip()[:128]
+        lines = [f"验证码：{code}"]
+        if tag:
+            lines.append(f"平台：{tag}")
+        lines.extend(
+            (
+                f"来源：{message.get('sender') or '未知'}",
+                f"接收号码：{receiver}",
+                f"接收时间：{received_at}",
+            )
         )
+        text = "\n".join(lines)
         response = self.client.request(
             "/open-apis/im/v1/messages",
             method="POST",
