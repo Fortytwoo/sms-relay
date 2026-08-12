@@ -10,6 +10,8 @@
 - 独立的 64 位写入与只读 API Key，支持 `X-API-Key` 和 Bearer Header。
 - SQLite 持久化，并按规范化消息内容的 SHA-256 指纹去重。
 - 自动识别 4–8 位数字或字母数字验证码。
+- 自动把短信中第一个非空 `【…】` 签名提取为 `tag`，历史短信无需迁移即可返回标签。
+- 根据受支持后台的 URL 精确识别小红书、快手、丁香、私域商城、微信小店和抖音商城。
 - 飞书 OAuth 登录、管理员与 SQLite 动态访问控制。
 - 从飞书只读同步企业组织架构，支持部门（含全部子部门）和个人授权。
 - 验证码点击复制，显示接收短信的 SIM 卡槽和手机号。
@@ -157,6 +159,7 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 | `POST /v1/messages` | 写入 API Key | 接收一条短信 |
 | `GET /v1/messages?limit=50&before_id=123` | 飞书会话或只读 API Key | 按 ID 倒序分页读取历史短信 |
 | `GET /v1/messages?limit=50&after_id=123` | 飞书会话或只读 API Key | 按 ID 正序获取游标之后的新短信 |
+| `GET /v1/platforms/identify?url=...` | 飞书会话或只读 API Key | 根据页面 URL 返回标准平台 `tag` |
 | `GET /auth/login` | 无 | 发起飞书 OAuth |
 | `GET /auth/callback` | OAuth state | 处理飞书回调 |
 | `GET /auth/session` | 飞书会话 | 返回当前登录用户 |
@@ -177,6 +180,40 @@ curl -X POST 'https://relay.example.com/sms-relay/v1/messages' \
 ```
 
 API Key 不支持 Query String，避免密钥进入浏览器历史和代理访问日志。
+
+### 短信标签与平台识别
+
+写入和读取短信时都会返回 `tag`、`sim_slot` 和 `sim_phone`。其中 `sim_phone`
+是从 Android 上报的 SIM 信息中解析出的接收手机号。服务从短信正文中按顺序查找第一个非空的
+`【…】`，去掉括号和首尾空白后作为标签。例如 `【小红书】验证码 483921` 的
+`tag` 是 `小红书`；没有短信签名时返回空字符串。标签在读取时动态生成，因此
+部署新版本后，已有历史短信也会立即带上 `tag`，不会改变正文或消息指纹。
+
+页面 URL 可通过独立接口识别为相同口径的平台标签：
+
+```bash
+curl --get 'https://relay.example.com/sms-relay/v1/platforms/identify' \
+  -H 'X-API-Key: <64-character-read-secret>' \
+  --data-urlencode 'url=https://ark.xiaohongshu.com/app-order/order/query'
+```
+
+```json
+{"ok":true,"recognized":true,"tag":"小红书"}
+```
+
+当前支持：
+
+| 页面域名 | `tag` |
+| --- | --- |
+| `ark.xiaohongshu.com` | `小红书` |
+| `s.kwaixiaodian.com` | `快手` |
+| `zhaoshang.dxycare.com` | `丁香` |
+| `portal.maiscrm.com` | `私域商城` |
+| `store.weixin.qq.com` | `微信小店` |
+| `fxg.jinritemai.com`、`doudian.douyinec.com` | `抖音商城` |
+
+识别使用解析后的完整 hostname 精确匹配；相似域名不会命中。未知平台返回
+`{"ok":true,"recognized":false,"tag":""}`。
 
 ### 增量获取新短信
 

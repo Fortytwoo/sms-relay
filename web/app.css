@@ -215,7 +215,10 @@ svg {
 .message-avatar svg { width: 25px; height: 25px; }
 .message-main { min-width: 0; }
 .message-head { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.message-identity { min-width: 0; display: flex; align-items: center; gap: 8px; }
 .message-sender { overflow: hidden; color: var(--color-ink); font-size: 17px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.message-platform-tag, .detail-platform-tag { max-width: 160px; overflow: hidden; border-radius: 999px; color: var(--color-primary-dark); background: #e8f1ff; font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
+.message-platform-tag { flex: 0 1 auto; padding: 3px 8px; font-size: 12px; }
 .message-time { flex: 0 0 auto; color: var(--color-muted); font-size: 13px; }
 .message-preview { margin: 7px 0 0; display: block; overflow: hidden; color: #3d4a60; line-height: 1.55; text-overflow: ellipsis; white-space: nowrap; }
 .message-chevron { width: 18px; height: 18px; color: #526176; }
@@ -236,6 +239,7 @@ svg {
 .detail-label { display: flex; align-items: center; gap: 10px; color: #33425a; font-weight: 650; }
 .detail-label svg { display: none; width: 25px; height: 25px; color: var(--color-primary); }
 .detail-value { min-width: 0; color: #1b283e; overflow-wrap: anywhere; }
+.detail-platform-tag { display: inline-block; padding: 6px 11px; font-size: 13px; vertical-align: middle; }
 .detail-sender-value { display: flex; align-items: center; gap: 8px; font-size: 17px; }
 .copy-button { width: 34px; height: 34px; display: grid; place-items: center; color: #526176; border-radius: 6px; }
 .copy-button:hover { color: var(--color-primary); background: var(--color-primary-soft); }

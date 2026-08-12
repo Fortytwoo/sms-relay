@@ -46,11 +46,14 @@ const elements = {
   listFooter: document.querySelector("#list-footer"),
   detailEmpty: document.querySelector("#detail-empty"),
   detailCard: document.querySelector("#detail-card"),
+  detailTagRow: document.querySelector("#detail-tag-row"),
+  detailTag: document.querySelector("#detail-tag"),
   detailSender: document.querySelector("#detail-sender"),
   detailContent: document.querySelector("#detail-content"),
   verificationRow: document.querySelector("#verification-row"),
   detailCode: document.querySelector("#detail-code"),
   detailTime: document.querySelector("#detail-time"),
+  detailPhone: document.querySelector("#detail-phone"),
   detailSim: document.querySelector("#detail-sim"),
   detailDevice: document.querySelector("#detail-device"),
   detailVersion: document.querySelector("#detail-version"),
@@ -222,7 +225,7 @@ function filteredMessages() {
   const query = elements.searchInput.value.trim().toLocaleLowerCase("zh-CN");
   if (!query) return state.messages;
   return state.messages.filter((message) =>
-    `${message.sender} ${message.content} ${message.verification_code || ""} ${simLabel(message)}`
+    `${message.sender} ${message.tag || ""} ${message.content} ${message.verification_code || ""} ${simLabel(message)}`
       .toLocaleLowerCase("zh-CN").includes(query));
 }
 
@@ -252,13 +255,22 @@ function buildMessageItem(message) {
   main.className = "message-main";
   const head = document.createElement("span");
   head.className = "message-head";
+  const identity = document.createElement("span");
+  identity.className = "message-identity";
   const sender = document.createElement("span");
   sender.className = "message-sender";
   sender.textContent = message.sender || "未知号码";
+  identity.append(sender);
+  if (message.tag) {
+    const tag = document.createElement("span");
+    tag.className = "message-platform-tag";
+    tag.textContent = message.tag;
+    identity.append(tag);
+  }
   const time = document.createElement("time");
   time.className = "message-time";
   time.textContent = shortDate(messageTime(message));
-  head.append(sender, time);
+  head.append(identity, time);
   const preview = document.createElement("span");
   preview.className = "message-preview";
   preview.textContent = message.verification_code
@@ -291,12 +303,17 @@ function renderDetail() {
   elements.detailEmpty.hidden = Boolean(selected);
   elements.detailCard.hidden = !selected;
   if (!selected) return;
+  elements.detailTagRow.hidden = !selected.tag;
+  elements.detailTag.textContent = selected.tag || "";
   elements.detailSender.textContent = selected.sender || "未知号码";
   elements.detailContent.textContent = selected.content;
   elements.verificationRow.hidden = !selected.verification_code;
   elements.detailCode.textContent = selected.verification_code || "";
   elements.detailTime.textContent = fullDate(messageTime(selected));
-  elements.detailSim.textContent = simLabel(selected);
+  elements.detailPhone.textContent = selected.sim_phone || "未提供";
+  elements.detailSim.textContent = selected.sim_slot
+    || (selected.sim_phone ? "未提供" : selected.sim_info)
+    || "未提供";
   elements.detailDevice.textContent = selected.device_name || "未提供";
   elements.detailVersion.textContent = selected.app_version || "未提供";
 }

@@ -63,6 +63,16 @@ _CODE_PATTERNS = (
 )
 _SIM_SLOT_PATTERN = re.compile(r"(?:SIM|卡)\s*([12])", re.IGNORECASE)
 _MOBILE_PATTERN = re.compile(r"(?<!\d)(?:\+?86[\s_-]?)?(1[3-9]\d{9})(?!\d)")
+_MESSAGE_TAG_PATTERN = re.compile(r"【([^【】]*)】")
+_PLATFORM_HOST_TAGS = {
+    "ark.xiaohongshu.com": "小红书",
+    "s.kwaixiaodian.com": "快手",
+    "zhaoshang.dxycare.com": "丁香",
+    "portal.maiscrm.com": "私域商城",
+    "store.weixin.qq.com": "微信小店",
+    "fxg.jinritemai.com": "抖音商城",
+    "doudian.douyinec.com": "抖音商城",
+}
 
 
 def utc_now() -> str:
@@ -85,10 +95,30 @@ def parse_sim_info(sim_info: str) -> tuple[str, str]:
     return slot, phone
 
 
+def extract_message_tag(content: str) -> str:
+    for match in _MESSAGE_TAG_PATTERN.finditer(content or ""):
+        tag = " ".join(match.group(1).split())
+        if tag:
+            return tag
+    return ""
+
+
+def identify_platform(url: str) -> str:
+    try:
+        parsed = urlsplit((url or "").strip())
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return ""
+        host = (parsed.hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    return _PLATFORM_HOST_TAGS.get(host, "")
+
+
 def enrich_message(row: dict[str, Any]) -> dict[str, Any]:
     message = dict(row)
     sim_slot, sim_phone = parse_sim_info(str(message.get("sim_info", "")))
     message["verification_code"] = extract_verification_code(str(message.get("content", "")))
+    message["tag"] = extract_message_tag(str(message.get("content", "")))
     message["sim_slot"] = sim_slot
     message["sim_phone"] = sim_phone
     return message
@@ -1054,6 +1084,23 @@ class RelayHandler(BaseHTTPRequestHandler):
                 {"ok": True, **self.server.access.access_summary()},
             )
             return
+        if parsed.path == "/v1/platforms/identify":
+            if not self.require_read_auth():
+                return
+            query = parse_qs(parsed.query, keep_blank_values=True)
+            url = str(query.get("url", [""])[0]).strip()
+            if not url or len(url) > 4096:
+                self.send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "url_is_required"},
+                )
+                return
+            tag = identify_platform(url)
+            self.send_json(
+                HTTPStatus.OK,
+                {"ok": True, "recognized": bool(tag), "tag": tag},
+            )
+            return
         if parsed.path != "/v1/messages":
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
@@ -1176,6 +1223,8 @@ class RelayHandler(BaseHTTPRequestHandler):
         source_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",", 1)[0].strip()[:64]
         server_received_at = utc_now()
         has_code = bool(extract_verification_code(message["content"]))
+        tag = extract_message_tag(message["content"])
+        sim_slot, sim_phone = parse_sim_info(message["sim_info"])
         initial_push_status = "pending" if has_code and self.server.notifier else "disabled" if has_code else "skipped"
 
         with open_db(self.server.db_path) as connection:
@@ -1224,6 +1273,9 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "id": row_id,
                 "duplicate": duplicate,
                 "message_key": message_key,
+                "tag": tag,
+                "sim_slot": sim_slot,
+                "sim_phone": sim_phone,
                 "lark_push_status": push_status,
             },
         )

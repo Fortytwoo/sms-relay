@@ -5,10 +5,17 @@ import tempfile
 import threading
 import unittest
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from app import RelayServer, extract_verification_code, parse_sim_info
+from app import (
+    RelayServer,
+    extract_message_tag,
+    extract_verification_code,
+    identify_platform,
+    parse_sim_info,
+)
 
 
 WRITE_API_KEY = "a" * 64
@@ -85,6 +92,8 @@ class RelayApiTests(unittest.TestCase):
         self.assertIn("短信中转", page)
         self.assertIn('id="feishu-login"', page)
         self.assertIn("飞书账号登录", page)
+        self.assertIn('id="detail-tag-row"', page)
+        self.assertIn('id="detail-phone"', page)
         self.assertEqual(headers["x-frame-options"], "DENY")
         self.assertIn("default-src 'self'", headers["content-security-policy"])
         self.assertEqual(css_status, 200)
@@ -93,6 +102,7 @@ class RelayApiTests(unittest.TestCase):
         self.assertNotIn("sessionStorage", js)
         self.assertNotIn("localStorage", js)
         self.assertNotIn("innerHTML", js)
+        self.assertIn("message.tag", js)
 
     def test_messages_require_api_key(self) -> None:
         status, body = self.request("GET", "/v1/messages")
@@ -127,6 +137,70 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(message["verification_code"], "483921")
         self.assertEqual(message["sim_slot"], "SIM2")
         self.assertEqual(message["sim_phone"], "13800000000")
+
+    def test_message_list_includes_tag_extracted_from_sms_signature(self) -> None:
+        status, inserted = self.request(
+            "POST",
+            "/v1/messages",
+            {
+                "from": "10690000",
+                "content": "【小红书】验证码 682143，请勿泄露",
+                "sim_info": "SIM1_13900000000",
+            },
+            WRITE_API_KEY,
+        )
+        list_status, listed = self.request(
+            "GET", "/v1/messages?limit=10", api_key=READ_API_KEY
+        )
+
+        self.assertEqual(status, 200)
+        self.assertFalse(inserted["duplicate"])
+        self.assertEqual(inserted["tag"], "小红书")
+        self.assertEqual(inserted["sim_slot"], "SIM1")
+        self.assertEqual(inserted["sim_phone"], "13900000000")
+        self.assertEqual(list_status, 200)
+        self.assertEqual(listed["messages"][0]["tag"], "小红书")
+
+    def test_identify_platform_endpoint_uses_authenticated_exact_host_matching(self) -> None:
+        cases = {
+            "https://ark.xiaohongshu.com/app-order/order/query": "小红书",
+            "https://s.kwaixiaodian.com/zone/order/list": "快手",
+            "https://zhaoshang.dxycare.com/system/download/index?pageSize=20&pageNo=1": "丁香",
+            "https://portal.maiscrm.com/navigator#/taskCenter": "私域商城",
+            "https://store.weixin.qq.com/shop/order/list": "微信小店",
+            "https://fxg.jinritemai.com/ffa/morder/order/list": "抖音商城",
+            "https://doudian.douyinec.com/login/common": "抖音商城",
+        }
+
+        unauthenticated_status, _ = self.request(
+            "GET",
+            "/v1/platforms/identify?url=https%3A%2F%2Fark.xiaohongshu.com%2F",
+        )
+        self.assertEqual(unauthenticated_status, 401)
+
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                encoded_url = urllib.parse.quote(url, safe="")
+                status, body = self.request(
+                    "GET",
+                    f"/v1/platforms/identify?url={encoded_url}",
+                    api_key=READ_API_KEY,
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(body["tag"], expected)
+                self.assertTrue(body["recognized"])
+
+        encoded_lookalike = urllib.parse.quote(
+            "https://ark.xiaohongshu.com.example.com/app-order/order/query", safe=""
+        )
+        status, body = self.request(
+            "GET",
+            f"/v1/platforms/identify?url={encoded_lookalike}",
+            api_key=READ_API_KEY,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body["tag"], "")
+        self.assertFalse(body["recognized"])
 
     def test_feishu_session_can_list_messages_without_api_key(self) -> None:
         payload = {
@@ -377,6 +451,25 @@ class RelayApiTests(unittest.TestCase):
 
 
 class MessageEnrichmentTests(unittest.TestCase):
+    def test_extracts_first_non_empty_bracket_tag(self) -> None:
+        self.assertEqual(
+            extract_message_tag("【  小红书  】验证码 123456【登录提醒】"),
+            "小红书",
+        )
+        self.assertEqual(extract_message_tag("【】验证码 123456【快手】"), "快手")
+        self.assertEqual(extract_message_tag("没有短信签名"), "")
+
+    def test_identifies_supported_platform_urls_without_lookalike_hosts(self) -> None:
+        self.assertEqual(
+            identify_platform("https://store.weixin.qq.com/shop/order/list"),
+            "微信小店",
+        )
+        self.assertEqual(
+            identify_platform("https://store.weixin.qq.com.evil.example/shop/order/list"),
+            "",
+        )
+        self.assertEqual(identify_platform("javascript:alert(1)"), "")
+
     def test_extracts_common_verification_code_formats(self) -> None:
         cases = {
             "验证码是123456，请勿泄露": "123456",
