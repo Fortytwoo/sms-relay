@@ -129,7 +129,7 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 | `device_name` | 上报设备名称 |
 | `app_version` | 上报应用版本 |
 | `message_key` | 用于去重的消息指纹 |
-| `verification_code` | 自动识别的验证码，未识别时为空字符串 |
+| `verification_code` | 自动识别的验证码，保留短信原始大小写；未识别时为空字符串 |
 | `sim_slot` | 自动解析的卡槽，如 `SIM1`、`SIM2` |
 | `sim_phone` | 自动解析的接收手机号 |
 | `lark_push_status` | 飞书推送状态 |

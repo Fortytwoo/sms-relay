@@ -83,7 +83,7 @@ def extract_verification_code(content: str) -> str:
     for pattern in _CODE_PATTERNS:
         match = pattern.search(content)
         if match:
-            return match.group(1).upper()
+            return match.group(1)
     return ""
 
 

@@ -479,6 +479,7 @@ class MessageEnrichmentTests(unittest.TestCase):
             "【抖音商城】订单导出文件已加密，解压密码为618204，请妥善保管": "618204",
             "动态码：4827，10分钟内有效": "4827",
             "Your OTP is A7C91D": "A7C91D",
+            "Your OTP is a7C91d": "a7C91d",
             "839204 是您的校验码": "839204",
             "security code = 771920": "771920",
         }
