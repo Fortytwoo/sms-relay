@@ -152,6 +152,17 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 }
 ```
 
+### 写入幂等语义
+
+同一短信由原 SmsForwarder 与可靠投递 Outbox 重复提交时，只保留一条记录。服务端的投递身份由以下四个原始字段构成：
+
+- `message_type`
+- `sender`
+- `content`
+- `source_received_at`
+
+`sim_info`、`device_name` 和 `app_version` 属于投递客户端元数据，不参与重复判断。重复请求返回已有消息的 `id`、`duplicate=true` 和当前 `lark_push_status`，不会再次推送飞书。验证码正文及其大小写仍逐字保留。
+
 ## 平台 URL 识别
 
 客户端可把当前页面 URL 交给服务端，获得与短信 `tag` 相同口径的平台名称：

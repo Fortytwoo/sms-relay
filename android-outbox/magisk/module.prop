@@ -1,0 +1,7 @@
+id=sms_reliable_outbox_systemizer
+name=SMS Reliable Outbox Systemizer
+version=1.1.0
+versionCode=4
+author=Fortytwoo
+description=Systemizes SMS Reliable Outbox and continuously enforces its runtime permissions.
+

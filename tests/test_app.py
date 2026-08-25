@@ -139,6 +139,41 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(message["sim_slot"], "SIM2")
         self.assertEqual(message["sim_phone"], "13800000000")
 
+    def test_duplicate_detection_ignores_delivery_client_metadata(self) -> None:
+        original = {
+            "type": "sms",
+            "from": "10690000",
+            "content": "【平台】验证码 a7C91d，请勿泄露",
+            "received_at": "2026-08-25 11:45:00",
+            "sim_info": "SIM2_中国电信_13900000000",
+            "device_name": "Xiaomi 22101317C",
+            "app_version": "3.5.0.260224",
+        }
+        compensating_client = dict(original)
+        compensating_client.update(
+            {
+                "sim_info": "SIM2_中国电信_",
+                "device_name": "Xiaomi 22101317C reliable outbox",
+                "app_version": "reliable-outbox/1.1.0",
+            }
+        )
+
+        first_status, first = self.request("POST", "/v1/messages", original, WRITE_API_KEY)
+        second_status, second = self.request(
+            "POST", "/v1/messages", compensating_client, WRITE_API_KEY
+        )
+        list_status, listed = self.request(
+            "GET", "/v1/messages?limit=10", api_key=READ_API_KEY
+        )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(list_status, 200)
+        self.assertEqual(listed["count"], 1)
+
     def test_message_list_includes_tag_extracted_from_sms_signature(self) -> None:
         status, inserted = self.request(
             "POST",

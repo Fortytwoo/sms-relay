@@ -151,6 +151,12 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 
 脚本会把 API Key 写入 SmsForwarder 数据库，因此数据库副本同样属于敏感文件，不能提交到仓库。
 
+### 可靠投递 Outbox
+
+`android-outbox/` 提供设备侧持久化补偿层。它在收到 `SMS_RECEIVED` 广播时先把短信同步写入私有 SQLite Outbox，只有服务端返回 HTTP 2xx 且 JSON `ok=true` 后才确认成功；DNS、网络和 5xx 故障按指数退避，并在网络重新验证后立即补传。
+
+原 SmsForwarder 和 Outbox 可以同时启用。服务端以短信类型、发送方、正文和设备接收时间作为投递身份，忽略客户端版本、设备名和 SIM 展示格式差异，因此补偿投递不会重复入库或重复推送飞书。设备安装、动态 Key 配置与 Magisk systemizer 说明见 [`android-outbox/README.md`](android-outbox/README.md)。
+
 ## API
 
 | 方法与路径 | 鉴权 | 说明 |
@@ -259,6 +265,7 @@ app.py                       HTTP API、OAuth、SQLite 与飞书通知
 access_control.py            企业目录快照、授权规则与审计
 web/                         无构建步骤的网页收件箱
 tests/                       标准库 unittest 测试
+android-outbox/              Android 持久化 Outbox、构建脚本与 Magisk systemizer
 configure_smsforwarder.py    SmsForwarder 数据库配置辅助脚本
 compose.yaml                 本地安全默认的容器部署
 nginx-location.conf          HTTPS 反向代理 location 示例

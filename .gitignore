@@ -3,6 +3,8 @@
 !.env.example
 .venv/
 __pycache__/
+android-outbox/build/
+android-outbox/signing/
 *.pyc
 .pytest_cache/
 .ruff_cache/

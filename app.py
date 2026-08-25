@@ -182,6 +182,12 @@ def init_db(db_path: str) -> None:
         connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at DESC)"
         )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_source_identity
+            ON messages(message_type, sender, source_received_at)
+            """
+        )
 
 
 def parse_message(payload: Any) -> dict[str, str]:
@@ -234,7 +240,17 @@ def parse_message(payload: Any) -> dict[str, str]:
 
 
 def fingerprint(message: dict[str, str]) -> str:
-    canonical = json.dumps(message, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    canonical = json.dumps(
+        {
+            "message_type": message["message_type"],
+            "sender": message["sender"],
+            "content": message["content"],
+            "source_received_at": message["source_received_at"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
@@ -1234,36 +1250,54 @@ class RelayHandler(BaseHTTPRequestHandler):
         initial_push_status = "pending" if has_code and self.server.notifier else "disabled" if has_code else "skipped"
 
         with open_db(self.server.db_path) as connection:
-            cursor = connection.execute(
+            stored = connection.execute(
                 """
-                INSERT OR IGNORE INTO messages (
-                    received_at, message_type, sender, content, source_received_at,
-                    sim_info, device_name, app_version, message_key, source_ip,
-                    lark_push_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT id, lark_push_status FROM messages
+                WHERE message_type = ? AND sender = ? AND content = ?
+                  AND source_received_at = ?
+                ORDER BY id ASC LIMIT 1
                 """,
                 (
-                    server_received_at,
                     message["message_type"],
                     message["sender"],
                     message["content"],
                     message["source_received_at"],
-                    message["sim_info"],
-                    message["device_name"],
-                    message["app_version"],
-                    message_key,
-                    source_ip,
-                    initial_push_status,
                 ),
-            )
-            duplicate = cursor.rowcount == 0
-            if duplicate:
+            ).fetchone()
+            if stored is not None:
+                duplicate = True
+                row_id, push_status = int(stored[0]), str(stored[1])
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO messages (
+                        received_at, message_type, sender, content, source_received_at,
+                        sim_info, device_name, app_version, message_key, source_ip,
+                        lark_push_status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        server_received_at,
+                        message["message_type"],
+                        message["sender"],
+                        message["content"],
+                        message["source_received_at"],
+                        message["sim_info"],
+                        message["device_name"],
+                        message["app_version"],
+                        message_key,
+                        source_ip,
+                        initial_push_status,
+                    ),
+                )
+                duplicate = cursor.rowcount == 0
+            if stored is None and duplicate:
                 stored = connection.execute(
                     "SELECT id, lark_push_status FROM messages WHERE message_key = ?",
                     (message_key,),
                 ).fetchone()
                 row_id, push_status = int(stored[0]), str(stored[1])
-            else:
+            elif stored is None:
                 row_id, push_status = int(cursor.lastrowid), initial_push_status
 
         if push_status in {"pending", "failed"} and self.server.notifier is not None:
