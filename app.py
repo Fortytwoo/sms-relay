@@ -61,7 +61,7 @@ _CODE_KEYWORD = (
     r"verification\s*code|security\s*code|one[-\s]*time\s*password|otp)"
 )
 _ARCHIVE_PASSWORD_KEYWORD = (
-    r"(?:解压(?:缩)?密码|压缩(?:包|文件)?(?:的)?密码|"
+    r"(?:(?:文件)?提取码|解压(?:缩)?密码|压缩(?:包|文件)?(?:的)?密码|"
     r"(?:导出|下载)文件(?:的)?(?:解压)?密码)"
 )
 _ARCHIVE_PASSWORD_TOKEN = (
