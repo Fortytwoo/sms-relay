@@ -8,8 +8,8 @@
 ## 功能
 
 - 独立的 64 位写入与只读 API Key，支持 `X-API-Key` 和 Bearer Header。
-- SQLite 持久化，并按规范化消息内容的 SHA-256 指纹去重。
-- 自动识别 4–8 位数字或字母数字验证码，保留验证码在短信中的原始大小写；支持登录验证码、快手验证码和导出文件解压密码等常见格式。
+- SQLite 持久化；同一发送方、正文和消息类型在 60 秒设备接收时间漂移内按同一短信去重。
+- 自动识别 4–8 位数字或字母数字验证码，以及 4–32 位字母数字解压密码；所有值均保留短信中的原始大小写。
 - 自动把短信中第一个非空 `【…】` 签名提取为 `tag`，历史短信无需迁移即可返回标签。
 - 根据受支持后台的 URL 精确识别小红书、快手、丁香、私域商城、微信小店和抖音商城。
 - 标准 OAuth 2.0 Authorization Code + PKCE `S256`，由中央授权系统统一决定应用入口权限。
@@ -166,7 +166,7 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 
 `android-outbox/` 提供设备侧持久化补偿层。它在收到 `SMS_RECEIVED` 广播时先把短信同步写入私有 SQLite Outbox，只有服务端返回 HTTP 2xx 且 JSON `ok=true` 后才确认成功；DNS、网络和 5xx 故障按指数退避，并在网络重新验证后立即补传。
 
-原 SmsForwarder 和 Outbox 可以同时启用。服务端以短信类型、发送方、正文和设备接收时间作为投递身份，忽略客户端版本、设备名和 SIM 展示格式差异，因此补偿投递不会重复入库或重复推送飞书。设备安装、动态 Key 配置与 Magisk systemizer 说明见 [`android-outbox/README.md`](android-outbox/README.md)。
+原 SmsForwarder 和 Outbox 可以同时启用。服务端以短信类型、发送方、正文和设备接收时间作为投递身份，忽略客户端版本、设备名和 SIM 展示格式差异；两个客户端上报的设备接收时间即使相差不超过 60 秒，也只会入库和推送一次。设备安装、动态 Key 配置与 Magisk systemizer 说明见 [`android-outbox/README.md`](android-outbox/README.md)。
 
 ## API
 

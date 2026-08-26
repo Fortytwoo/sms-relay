@@ -317,6 +317,140 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(list_status, 200)
         self.assertEqual(listed["count"], 1)
 
+    def test_duplicate_detection_tolerates_source_timestamp_drift(self) -> None:
+        class Recorder:
+            def __init__(self) -> None:
+                self.messages: list[dict] = []
+
+            def send(self, message: dict) -> None:
+                self.messages.append(message)
+
+        recorder = Recorder()
+        self.server.notifier = recorder
+        sms_forwarder = {
+            "type": "sms",
+            "from": "10690000",
+            "content": "【抖音商城】订单导出文件已加密，解压密码为gVtFmd，请妥善保管",
+            "received_at": "2026-08-26 12:55:04",
+            "sim_info": "SIM2_中国电信_13900000000",
+            "device_name": "Xiaomi 22101317C",
+            "app_version": "3.5.0.260224",
+        }
+        reliable_outbox = dict(sms_forwarder)
+        reliable_outbox.update(
+            {
+                "received_at": "2026-08-26 12:55:02",
+                "sim_info": "SIM2_中国电信_",
+                "device_name": "Xiaomi 22101317C reliable outbox",
+                "app_version": "reliable-outbox/1.1.0",
+            }
+        )
+
+        first_status, first = self.request(
+            "POST", "/v1/messages", sms_forwarder, WRITE_API_KEY
+        )
+        second_status, second = self.request(
+            "POST", "/v1/messages", reliable_outbox, WRITE_API_KEY
+        )
+        list_status, listed = self.request(
+            "GET", "/v1/messages?limit=10", api_key=READ_API_KEY
+        )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["message_key"], first["message_key"])
+        self.assertEqual(list_status, 200)
+        self.assertEqual(listed["count"], 1)
+        self.assertEqual(len(recorder.messages), 1)
+        self.assertEqual(recorder.messages[0]["verification_code"], "gVtFmd")
+
+    def test_same_message_outside_timestamp_drift_window_is_not_duplicate(self) -> None:
+        original = {
+            "type": "sms",
+            "from": "10690000",
+            "content": "【平台】验证码 482701，请勿泄露",
+            "received_at": "2026-08-26 12:55:04",
+        }
+        later_message = dict(original)
+        later_message["received_at"] = "2026-08-26 12:56:05"
+
+        first_status, first = self.request(
+            "POST", "/v1/messages", original, WRITE_API_KEY
+        )
+        second_status, second = self.request(
+            "POST", "/v1/messages", later_message, WRITE_API_KEY
+        )
+        list_status, listed = self.request(
+            "GET", "/v1/messages?limit=10", api_key=READ_API_KEY
+        )
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertFalse(first["duplicate"])
+        self.assertFalse(second["duplicate"])
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(list_status, 200)
+        self.assertEqual(listed["count"], 2)
+
+    def test_concurrent_timestamp_drift_deliveries_only_notify_once(self) -> None:
+        class Recorder:
+            def __init__(self) -> None:
+                self.messages: list[dict] = []
+
+            def send(self, message: dict) -> None:
+                self.messages.append(message)
+
+        recorder = Recorder()
+        self.server.notifier = recorder
+        first_payload = {
+            "type": "sms",
+            "from": "10690000",
+            "content": "【抖音商城】解压密码为AbCdEf，请妥善保管",
+            "received_at": "2026-08-26 13:06:54",
+            "app_version": "3.5.0.260224",
+        }
+        second_payload = dict(first_payload)
+        second_payload.update(
+            {
+                "received_at": "2026-08-26 13:06:55",
+                "app_version": "reliable-outbox/1.1.0",
+            }
+        )
+        barrier = threading.Barrier(3)
+        results: list[tuple[int, dict]] = []
+        errors: list[BaseException] = []
+
+        def submit(payload: dict[str, str]) -> None:
+            try:
+                barrier.wait()
+                results.append(
+                    self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=submit, args=(payload,))
+            for payload in (first_payload, second_payload)
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 2)
+        self.assertEqual([status for status, _body in results], [200, 200])
+        bodies = [body for _status, body in results]
+        self.assertEqual(sorted(body["duplicate"] for body in bodies), [False, True])
+        self.assertEqual(len({body["id"] for body in bodies}), 1)
+        self.assertEqual(len({body["message_key"] for body in bodies}), 1)
+        self.assertEqual(len(recorder.messages), 1)
+
     def test_message_list_includes_tag_extracted_from_sms_signature(self) -> None:
         status, inserted = self.request(
             "POST",
@@ -779,6 +913,7 @@ class MessageEnrichmentTests(unittest.TestCase):
             "【丁香园】您的丁香园账号登录验证码 482701，请勿泄露。": "482701",
             "【快手科技】739205快手验证码，15分钟内有效，仅用于登录。": "739205",
             "【抖音商城】订单导出文件已加密，解压密码为618204，请妥善保管": "618204",
+            "【抖音商城】订单导出文件已加密，解压密码为gVtFmd，请妥善保管": "gVtFmd",
             "动态码：4827，10分钟内有效": "4827",
             "Your OTP is A7C91D": "A7C91D",
             "Your OTP is a7C91d": "a7C91d",

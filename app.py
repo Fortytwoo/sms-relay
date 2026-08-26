@@ -42,6 +42,7 @@ SESSION_ABSOLUTE_SECONDS = 7 * 24 * 60 * 60
 OAUTH_STATE_SECONDS = 5 * 60
 MAX_OAUTH_TRANSACTIONS = 2048
 REFRESH_SKEW_SECONDS = 60
+MESSAGE_DEDUPLICATION_WINDOW_SECONDS = 60
 WEB_ROOT = Path(__file__).with_name("web")
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
@@ -59,7 +60,26 @@ _CODE_KEYWORD = (
     r"(?:验证码|校验码|动态码|短信码|一次性密码|解压密码|"
     r"verification\s*code|security\s*code|one[-\s]*time\s*password|otp)"
 )
+_ARCHIVE_PASSWORD_KEYWORD = (
+    r"(?:解压(?:缩)?密码|压缩(?:包|文件)?(?:的)?密码|"
+    r"(?:导出|下载)文件(?:的)?(?:解压)?密码)"
+)
+_ARCHIVE_PASSWORD_TOKEN = (
+    r"(?<![A-Z0-9])"
+    r"([A-Z0-9]{4,32})"
+    r"(?![A-Z0-9])"
+)
 _CODE_PATTERNS = (
+    re.compile(
+        rf"{_ARCHIVE_PASSWORD_KEYWORD}\s*"
+        rf"(?:(?:是|为|is|[:：=,，-])\s*){{0,3}}{_ARCHIVE_PASSWORD_TOKEN}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"{_ARCHIVE_PASSWORD_TOKEN}\s*(?:是|为|is)?\s*"
+        rf"(?:您的|本次|文件的)?\s*{_ARCHIVE_PASSWORD_KEYWORD}",
+        re.IGNORECASE,
+    ),
     re.compile(
         rf"{_CODE_KEYWORD}\s*(?:(?:是|为|为您|is|[:：=,，-])\s*){{0,3}}{_CODE_TOKEN}",
         re.IGNORECASE,
@@ -291,6 +311,60 @@ def fingerprint(message: dict[str, str]) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _parse_source_received_at(value: str) -> datetime | None:
+    normalized = (value or "").strip()
+    if not normalized:
+        return None
+    if normalized.endswith(("Z", "z")):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _source_timestamp_delta_seconds(left: str, right: str) -> float | None:
+    if left == right:
+        return 0.0
+    left_timestamp = _parse_source_received_at(left)
+    right_timestamp = _parse_source_received_at(right)
+    if left_timestamp is None or right_timestamp is None:
+        return None
+    left_aware = left_timestamp.tzinfo is not None
+    right_aware = right_timestamp.tzinfo is not None
+    if left_aware != right_aware:
+        return None
+    if left_aware:
+        left_timestamp = left_timestamp.astimezone(timezone.utc)
+        right_timestamp = right_timestamp.astimezone(timezone.utc)
+    return abs((left_timestamp - right_timestamp).total_seconds())
+
+
+def _find_existing_message(
+    connection: sqlite3.Connection,
+    message: dict[str, str],
+) -> sqlite3.Row | None:
+    candidates = connection.execute(
+        """
+        SELECT id, source_received_at, message_key, lark_push_status
+        FROM messages
+        WHERE message_type = ? AND sender = ? AND content = ?
+        """,
+        (message["message_type"], message["sender"], message["content"]),
+    ).fetchall()
+    matches: list[tuple[float, int, sqlite3.Row]] = []
+    for candidate in candidates:
+        delta = _source_timestamp_delta_seconds(
+            str(candidate["source_received_at"]),
+            message["source_received_at"],
+        )
+        if delta is not None and delta <= MESSAGE_DEDUPLICATION_WINDOW_SECONDS:
+            matches.append((delta, int(candidate["id"]), candidate))
+    if not matches:
+        return None
+    return min(matches, key=lambda item: (item[0], item[1]))[2]
 
 
 def _base64url_encode(value: bytes) -> str:
@@ -1320,24 +1394,17 @@ class RelayHandler(BaseHTTPRequestHandler):
         sim_slot, sim_phone = parse_sim_info(message["sim_info"])
         initial_push_status = "pending" if has_code and self.server.notifier else "disabled" if has_code else "skipped"
 
+        response_message_key = message_key
         with open_db(self.server.db_path) as connection:
-            stored = connection.execute(
-                """
-                SELECT id, lark_push_status FROM messages
-                WHERE message_type = ? AND sender = ? AND content = ?
-                  AND source_received_at = ?
-                ORDER BY id ASC LIMIT 1
-                """,
-                (
-                    message["message_type"],
-                    message["sender"],
-                    message["content"],
-                    message["source_received_at"],
-                ),
-            ).fetchone()
+            # The read and insert must be one write transaction so simultaneous
+            # deliveries with slightly different device timestamps cannot both win.
+            connection.execute("BEGIN IMMEDIATE")
+            stored = _find_existing_message(connection, message)
             if stored is not None:
                 duplicate = True
-                row_id, push_status = int(stored[0]), str(stored[1])
+                row_id = int(stored["id"])
+                push_status = str(stored["lark_push_status"])
+                response_message_key = str(stored["message_key"])
             else:
                 cursor = connection.execute(
                     """
@@ -1383,7 +1450,7 @@ class RelayHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "id": row_id,
                 "duplicate": duplicate,
-                "message_key": message_key,
+                "message_key": response_message_key,
                 "tag": tag,
                 "sim_slot": sim_slot,
                 "sim_phone": sim_phone,

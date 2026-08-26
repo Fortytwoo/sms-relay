@@ -129,7 +129,7 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 | `device_name` | 上报设备名称 |
 | `app_version` | 上报应用版本 |
 | `message_key` | 用于去重的消息指纹 |
-| `verification_code` | 自动识别的验证码，保留短信原始大小写；未识别时为空字符串 |
+| `verification_code` | 自动识别的验证码或解压密码，保留短信原始大小写；未识别时为空字符串 |
 | `sim_slot` | 自动解析的卡槽，如 `SIM1`、`SIM2` |
 | `sim_phone` | 自动解析的接收手机号 |
 | `lark_push_status` | 飞书推送状态 |
@@ -154,14 +154,14 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 
 ### 写入幂等语义
 
-同一短信由原 SmsForwarder 与可靠投递 Outbox 重复提交时，只保留一条记录。服务端的投递身份由以下四个原始字段构成：
+同一短信由原 SmsForwarder 与可靠投递 Outbox 重复提交时，只保留一条记录。服务端按以下字段判断投递身份：
 
 - `message_type`
 - `sender`
 - `content`
-- `source_received_at`
+- `source_received_at`（可解析时间相差不超过 60 秒时视为同一接收时间）
 
-`sim_info`、`device_name` 和 `app_version` 属于投递客户端元数据，不参与重复判断。重复请求返回已有消息的 `id`、`duplicate=true` 和当前 `lark_push_status`，不会再次推送飞书。验证码正文及其大小写仍逐字保留。
+`message_type`、`sender` 和 `content` 必须逐字一致；只有设备接收时间允许上述小幅漂移。时间为空、格式不可解析或一个带时区而另一个不带时区时，仅逐字相同才会去重。`sim_info`、`device_name` 和 `app_version` 属于投递客户端元数据，不参与重复判断。重复请求返回已有消息的 `id`、`message_key`、`duplicate=true` 和当前 `lark_push_status`，不会再次推送飞书。验证码及解压密码的正文和大小写均逐字保留。
 
 ## 平台 URL 识别
 
