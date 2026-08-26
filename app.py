@@ -47,6 +47,7 @@ STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8", "public, max-age=3600"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8", "public, max-age=3600"),
+    "/assets/login-visual.svg": ("login-visual.svg", "image/svg+xml", "public, max-age=3600"),
 }
 
 _CODE_TOKEN = (

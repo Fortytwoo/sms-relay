@@ -111,6 +111,7 @@ function showLogin(message = "") {
   state.messages = [];
   state.selectedId = null;
   document.body.classList.remove("detail-open");
+  document.body.classList.add("is-auth-view");
   elements.inboxView.hidden = true;
   elements.mainNav.hidden = true;
   elements.topbarActions.hidden = true;
@@ -122,6 +123,7 @@ function showLogin(message = "") {
 
 function showInbox(user) {
   state.user = user;
+  document.body.classList.remove("is-auth-view");
   elements.signedInUser.textContent = user.name || "统一认证用户";
   elements.loginView.hidden = true;
   elements.mainNav.hidden = false;

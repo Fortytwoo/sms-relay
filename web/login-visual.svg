@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 752 911" role="img" aria-label="统一身份认证视觉背景">
+  <defs>
+    <linearGradient id="bg" x1="80" y1="35" x2="680" y2="860" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#eef4ff"/>
+      <stop offset="1" stop-color="#eafcff"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#3272f1"/>
+      <stop offset="1" stop-color="#16b9c8"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-30%" width="140%" height="170%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#5276a8" flood-opacity=".16"/>
+    </filter>
+    <filter id="smallShadow" x="-30%" y="-40%" width="160%" height="190%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#5276a8" flood-opacity=".15"/>
+    </filter>
+  </defs>
+  <rect width="752" height="911" fill="url(#bg)"/>
+  <g fill="none" stroke-linecap="round">
+    <circle cx="376" cy="455" r="330" stroke="#dce7fb" stroke-width="2"/>
+    <circle cx="376" cy="455" r="278" stroke="#d7e4f8" stroke-width="2"/>
+    <circle cx="376" cy="455" r="214" stroke="#cae8f0" stroke-width="2"/>
+    <circle cx="376" cy="455" r="146" stroke="#c4e7ee" stroke-width="2"/>
+    <path d="M83 306c83-127 205-191 365-190" stroke="#e6eefc" stroke-width="12" opacity=".65"/>
+    <path d="M166 744c94 66 207 91 339 69" stroke="#dff4f6" stroke-width="11" opacity=".8"/>
+  </g>
+  <g filter="url(#shadow)">
+    <rect x="104" y="312" width="544" height="194" rx="22" fill="#fff" fill-opacity=".93"/>
+    <rect x="137" y="349" width="48" height="48" rx="14" fill="url(#brand)"/>
+    <path d="m151 373 9 9 15-20" fill="none" stroke="#fff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="137" y="424" fill="#657792" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="15">身份已验证</text>
+    <text x="137" y="454" fill="#10182a" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="25" font-weight="700">安全访问工作台</text>
+    <text x="137" y="482" fill="#3970ee" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="14" letter-spacing="2">FEISHU · SSO</text>
+  </g>
+  <g transform="rotate(4 610 285)" filter="url(#smallShadow)">
+    <rect x="548" y="234" width="150" height="108" rx="18" fill="#fff" fill-opacity=".96"/>
+    <text x="573" y="272" fill="#8593a8" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="14">一次验证</text>
+    <text x="573" y="307" fill="#16aebd" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="24" font-weight="700">全局通行</text>
+  </g>
+  <g opacity=".8">
+    <circle cx="89" cy="584" r="5" fill="#2f62ff"/>
+    <circle cx="662" cy="574" r="5" fill="#17b9c8"/>
+    <circle cx="542" cy="162" r="4" fill="#8cb0ff"/>
+  </g>
+</svg>
