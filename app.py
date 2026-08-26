@@ -19,22 +19,29 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
-from access_control import (
-    AccessConflictError,
-    AccessControl,
-    InvalidAccessSubjectError,
+from central_auth import (
+    CentralAuthError,
+    CentralAuthInvalidGrant,
+    CentralAuthRejected,
+    CentralAuthUnavailable,
+    CentralOAuthClient,
+    validate_introspection,
+    validate_token_response,
 )
 
 
 MAX_BODY_BYTES = 64 * 1024
 MAX_CONTENT_CHARS = 32 * 1024
 SESSION_COOKIE_NAME = "sms_relay_session"
-SESSION_SECONDS = 12 * 60 * 60
+OAUTH_TRANSACTION_COOKIE_NAME = "sms_relay_oauth_tx"
+SESSION_IDLE_SECONDS = 12 * 60 * 60
+SESSION_ABSOLUTE_SECONDS = 7 * 24 * 60 * 60
 OAUTH_STATE_SECONDS = 5 * 60
-MAX_OAUTH_STATES = 2048
+MAX_OAUTH_TRANSACTIONS = 2048
+REFRESH_SKEW_SECONDS = 60
 WEB_ROOT = Path(__file__).with_name("web")
 STATIC_FILES = {
     "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
@@ -167,6 +174,37 @@ def init_db(db_path: str) -> None:
             )
             """
         )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oauth_transactions (
+                state_hash TEXT PRIMARY KEY,
+                browser_hash TEXT NOT NULL,
+                code_verifier TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oauth_sessions (
+                session_hash TEXT PRIMARY KEY,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT NOT NULL,
+                access_expires_at INTEGER NOT NULL,
+                principal_json TEXT NOT NULL,
+                validated_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_seen_at INTEGER NOT NULL,
+                idle_expires_at INTEGER NOT NULL,
+                absolute_expires_at INTEGER NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oauth_sessions_expiry "
+            "ON oauth_sessions(absolute_expires_at, idle_expires_at)"
+        )
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(messages)").fetchall()
         }
@@ -258,10 +296,6 @@ def _base64url_encode(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
 
 
-def _base64url_decode(value: str) -> bytes:
-    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-
-
 def _json_request(
     url: str,
     *,
@@ -329,7 +363,6 @@ class FeishuClient:
         method: str = "GET",
         params: dict[str, Any] | None = None,
         payload: dict[str, Any] | None = None,
-        directory_request: bool = False,
     ) -> dict[str, Any]:
         with self._request_lock:
             token = self.tenant_access_token()
@@ -351,106 +384,6 @@ class FeishuClient:
                 f"{str(response.get('msg') or 'unknown')[:240]}"
             )
         return response
-
-    def fetch_directory(
-        self,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], set[tuple[str, str]]]:
-        departments: list[dict[str, Any]] = [
-            {
-                "department_id": "0",
-                "parent_department_id": "",
-                "name": "企业",
-                "order": 0,
-                "member_count": 0,
-            }
-        ]
-        page_token = ""
-        while True:
-            params: dict[str, Any] = {
-                "department_id_type": "open_department_id",
-                "user_id_type": "open_id",
-                "page_size": 50,
-                "fetch_child": "true",
-            }
-            if page_token:
-                params["page_token"] = page_token
-            response = self.request(
-                "/open-apis/contact/v3/departments/0/children",
-                params=params,
-                directory_request=True,
-            )
-            data = response.get("data") or {}
-            for item in data.get("items") or []:
-                department_id = str(item.get("open_department_id") or "")
-                if not department_id:
-                    continue
-                departments.append(
-                    {
-                        "department_id": department_id,
-                        "parent_department_id": str(
-                            item.get("parent_department_id")
-                            or item.get("parent_open_department_id")
-                            or "0"
-                        ),
-                        "name": str(item.get("name") or "未命名部门"),
-                        "order": int(item.get("order") or 0),
-                        "member_count": int(item.get("member_count") or 0),
-                    }
-                )
-            if not data.get("has_more"):
-                break
-            page_token = str(data.get("page_token") or "")
-            if not page_token:
-                raise RuntimeError("feishu_directory_missing_page_token")
-
-        users_by_id: dict[str, dict[str, Any]] = {}
-        memberships: set[tuple[str, str]] = set()
-        for department in departments:
-            department_id = str(department["department_id"])
-            page_token = ""
-            while True:
-                params = {
-                    "department_id": department_id,
-                    "department_id_type": "open_department_id",
-                    "user_id_type": "open_id",
-                    "page_size": 50,
-                }
-                if page_token:
-                    params["page_token"] = page_token
-                response = self.request(
-                    "/open-apis/contact/v3/users/find_by_department",
-                    params=params,
-                    directory_request=True,
-                )
-                data = response.get("data") or {}
-                for item in data.get("items") or []:
-                    open_id = str(item.get("open_id") or "")
-                    if not open_id:
-                        continue
-                    status = item.get("status") or {}
-                    active = not bool(status.get("is_resigned") or status.get("is_frozen"))
-                    if "is_activated" in status:
-                        active = active and bool(status.get("is_activated"))
-                    avatar = item.get("avatar") or {}
-                    users_by_id[open_id] = {
-                        "open_id": open_id,
-                        "union_id": str(item.get("union_id") or ""),
-                        "name": str(item.get("name") or "飞书用户"),
-                        "avatar_url": str(
-                            avatar.get("avatar_72") or avatar.get("avatar_origin") or ""
-                        ),
-                        "active": active,
-                    }
-                    memberships.add((open_id, department_id))
-                    for listed_department_id in item.get("department_ids") or []:
-                        memberships.add((open_id, str(listed_department_id)))
-                if not data.get("has_more"):
-                    break
-                page_token = str(data.get("page_token") or "")
-                if not page_token:
-                    raise RuntimeError("feishu_users_missing_page_token")
-        return departments, list(users_by_id.values()), memberships
-
 
 class FeishuNotifier:
     def __init__(
@@ -505,17 +438,25 @@ class RelayServer(ThreadingHTTPServer):
         db_path: str,
         *,
         read_api_key: str,
-        session_secret: str | None = None,
         feishu_app_id: str = "",
         feishu_app_secret: str = "",
-        feishu_redirect_uri: str = "",
         feishu_chat_id: str = "",
-        allowed_open_ids: set[str] | None = None,
-        admin_open_ids: set[str] | None = None,
-        admin_union_ids: set[str] | None = None,
+        auth_issuer: str = "https://auth.midi.lizhijian.xyz",
+        auth_client_id: str = "sms-relay-web",
+        auth_audience: str = "sms-relay-api",
+        auth_scopes: tuple[str, ...] = ("sms-relay:access",),
+        auth_redirect_uri: str = "https://api.midi.lizhijian.xyz/sms-relay/auth/callback",
+        auth_post_logout_redirect_uri: str = (
+            "https://api.midi.lizhijian.xyz/sms-relay/?auto_sso=off"
+        ),
+        auth_backchannel_ip: str = "",
         public_cookie_path: str = "/sms-relay/",
+        session_idle_seconds: int = SESSION_IDLE_SECONDS,
+        session_absolute_seconds: int = SESSION_ABSOLUTE_SECONDS,
+        introspection_cache_seconds: int = 5,
         notifier: FeishuNotifier | None = None,
         feishu_client: FeishuClient | None = None,
+        auth_client: CentralOAuthClient | Any | None = None,
     ):
         if len(api_key) != 64:
             raise ValueError("SMS_RELAY_API_KEY must contain exactly 64 characters")
@@ -526,17 +467,34 @@ class RelayServer(ThreadingHTTPServer):
         self.api_key = api_key
         self.read_api_key = read_api_key
         self.db_path = db_path
-        self.session_secret = (session_secret or api_key).encode("utf-8")
-        if len(self.session_secret) < 32:
-            raise ValueError("SMS_RELAY_SESSION_SECRET must contain at least 32 characters")
         self.feishu_app_id = feishu_app_id
         self.feishu_app_secret = feishu_app_secret
-        self.feishu_redirect_uri = feishu_redirect_uri
-        self.admin_open_ids = set(admin_open_ids or allowed_open_ids or set())
-        self.admin_union_ids = set(admin_union_ids or set())
         self.public_cookie_path = public_cookie_path
-        self.oauth_states: dict[str, tuple[float, str]] = {}
-        self.oauth_states_lock = threading.Lock()
+        self.session_idle_seconds = max(int(session_idle_seconds), 60)
+        self.session_absolute_seconds = max(
+            int(session_absolute_seconds), self.session_idle_seconds
+        )
+        self.introspection_cache_seconds = max(int(introspection_cache_seconds), 0)
+        self.auth_client = auth_client or CentralOAuthClient(
+            issuer=auth_issuer,
+            client_id=auth_client_id,
+            audience=auth_audience,
+            scopes=auth_scopes,
+            redirect_uri=auth_redirect_uri,
+            post_logout_redirect_uri=auth_post_logout_redirect_uri,
+            backchannel_ip=auth_backchannel_ip,
+        )
+        self.auth_issuer = str(self.auth_client.issuer).rstrip("/")
+        self.auth_client_id = str(self.auth_client.client_id)
+        self.auth_audience = str(self.auth_client.audience)
+        self.auth_scopes = tuple(self.auth_client.scopes)
+        self.auth_redirect_uri = str(self.auth_client.redirect_uri)
+        self.auth_post_logout_redirect_uri = str(
+            self.auth_client.post_logout_redirect_uri
+        )
+        self.auth_success_uri = self._derive_success_uri(self.auth_redirect_uri)
+        self.oauth_lock = threading.Lock()
+        self.invalid_session_hashes: set[str] = set()
         self.notifier = notifier
         self.feishu_client = feishu_client
         if self.feishu_client is None and feishu_app_id and feishu_app_secret:
@@ -552,14 +510,7 @@ class RelayServer(ThreadingHTTPServer):
         self.notification_stop = threading.Event()
         self.notification_event = threading.Event()
         self.notification_thread: threading.Thread | None = None
-        self.directory_thread: threading.Thread | None = None
-        self.directory_thread_lock = threading.Lock()
         init_db(db_path)
-        self.access = AccessControl(
-            db_path,
-            admin_open_ids=self.admin_open_ids,
-            admin_union_ids=self.admin_union_ids,
-        )
         super().__init__(address, RelayHandler)
         if self.notifier is not None:
             self.notification_thread = threading.Thread(
@@ -570,36 +521,31 @@ class RelayServer(ThreadingHTTPServer):
             self.notification_thread.start()
             self.notification_event.set()
 
-    @property
-    def oauth_is_configured(self) -> bool:
-        return bool(self.feishu_app_id and self.feishu_app_secret and self.feishu_redirect_uri)
+    @staticmethod
+    def _derive_success_uri(redirect_uri: str) -> str:
+        parsed = urlsplit(redirect_uri)
+        suffix = "/auth/callback"
+        if not parsed.path.endswith(suffix):
+            raise ValueError("AUTH_REDIRECT_URI must end with /auth/callback")
+        path = parsed.path[: -len(suffix)].rstrip("/") + "/"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
-    def _session_value(self, open_id: str, name: str, union_id: str = "") -> str:
-        payload = _base64url_encode(
-            json.dumps(
-                {
-                    "open_id": open_id,
-                    "union_id": union_id,
-                    "name": name,
-                    "csrf": secrets.token_urlsafe(24),
-                    "exp": int(time.time()) + SESSION_SECONDS,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        )
-        signature = _base64url_encode(
-            hmac.new(self.session_secret, payload.encode("ascii"), hashlib.sha256).digest()
-        )
-        return f"{payload}.{signature}"
+    @staticmethod
+    def _handle_hash(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-    def make_session_cookie(self, open_id: str, name: str, union_id: str = "") -> str:
-        return f"{SESSION_COOKIE_NAME}={self._session_value(open_id, name, union_id)}"
+    @staticmethod
+    def _cookie_value(raw_cookie: str, name: str) -> str:
+        try:
+            cookie = SimpleCookie(raw_cookie)
+            return str(cookie[name].value)
+        except (KeyError, ValueError):
+            return ""
 
-    def session_set_cookie(self, open_id: str, name: str, union_id: str = "") -> str:
+    def session_set_cookie(self, handle: str) -> str:
         return (
-            f"{self.make_session_cookie(open_id, name, union_id)}; Path={self.public_cookie_path}; "
-            f"Max-Age={SESSION_SECONDS}; HttpOnly; Secure; SameSite=Lax"
+            f"{SESSION_COOKIE_NAME}={handle}; Path={self.public_cookie_path}; "
+            f"Max-Age={self.session_absolute_seconds}; HttpOnly; Secure; SameSite=Lax"
         )
 
     def session_clear_cookie(self) -> str:
@@ -608,130 +554,262 @@ class RelayServer(ThreadingHTTPServer):
             "HttpOnly; Secure; SameSite=Lax"
         )
 
-    def parse_session_cookie(self, raw_cookie: str) -> dict[str, Any] | None:
-        try:
-            cookie = SimpleCookie(raw_cookie)
-            value = cookie[SESSION_COOKIE_NAME].value
-            payload, signature = value.split(".", 1)
-            expected = hmac.new(
-                self.session_secret, payload.encode("ascii"), hashlib.sha256
-            ).digest()
-            if not hmac.compare_digest(_base64url_decode(signature), expected):
-                return None
-            data = json.loads(_base64url_decode(payload).decode("utf-8"))
-            if int(data.get("exp", 0)) < int(time.time()):
-                return None
-            if not data.get("open_id") or not data.get("csrf"):
-                return None
-            return data
-        except (KeyError, ValueError, TypeError, json.JSONDecodeError):
-            return None
+    def transaction_set_cookie(self, browser_binding: str) -> str:
+        return (
+            f"{OAUTH_TRANSACTION_COOKIE_NAME}={browser_binding}; "
+            f"Path={self.public_cookie_path}; Max-Age={OAUTH_STATE_SECONDS}; "
+            "HttpOnly; Secure; SameSite=Lax"
+        )
 
-    def create_oauth_state(self) -> tuple[str, str]:
+    def transaction_clear_cookie(self) -> str:
+        return (
+            f"{OAUTH_TRANSACTION_COOKIE_NAME}=; Path={self.public_cookie_path}; "
+            "Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+        )
+
+    def create_oauth_transaction(self) -> tuple[str, str, str]:
         state = secrets.token_urlsafe(32)
         verifier = secrets.token_urlsafe(64)
-        now = time.time()
-        with self.oauth_states_lock:
-            self.oauth_states = {
-                key: value for key, value in self.oauth_states.items() if value[0] > now
-            }
-            self.oauth_states[state] = (now + OAUTH_STATE_SECONDS, verifier)
-            while len(self.oauth_states) > MAX_OAUTH_STATES:
-                self.oauth_states.pop(next(iter(self.oauth_states)))
-        return state, verifier
+        browser_binding = secrets.token_urlsafe(32)
+        now = int(time.time())
+        with open_db(self.db_path) as connection:
+            connection.execute(
+                "DELETE FROM oauth_transactions WHERE expires_at <= ?",
+                (now,),
+            )
+            connection.execute(
+                """
+                INSERT INTO oauth_transactions (
+                    state_hash, browser_hash, code_verifier, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    self._handle_hash(state),
+                    self._handle_hash(browser_binding),
+                    verifier,
+                    now + OAUTH_STATE_SECONDS,
+                    now,
+                ),
+            )
+            connection.execute(
+                """
+                DELETE FROM oauth_transactions
+                WHERE state_hash IN (
+                    SELECT state_hash FROM oauth_transactions
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT -1 OFFSET ?
+                )
+                """,
+                (MAX_OAUTH_TRANSACTIONS,),
+            )
+        return state, verifier, browser_binding
 
-    def consume_oauth_state(self, state: str) -> str | None:
-        with self.oauth_states_lock:
-            stored = self.oauth_states.pop(state, None)
-        if not stored or stored[0] < time.time():
+    def consume_oauth_transaction(self, state: str, browser_binding: str) -> str | None:
+        if not state or not browser_binding:
             return None
-        return stored[1]
+        state_hash = self._handle_hash(state)
+        browser_hash = self._handle_hash(browser_binding)
+        now = int(time.time())
+        with open_db(self.db_path) as connection:
+            row = connection.execute(
+                """
+                DELETE FROM oauth_transactions
+                WHERE state_hash = ? AND browser_hash = ? AND expires_at > ?
+                RETURNING code_verifier
+                """,
+                (state_hash, browser_hash, now),
+            ).fetchone()
+            if row is None:
+                return None
+        return str(row["code_verifier"])
 
-    def exchange_feishu_code(self, code: str) -> dict[str, Any]:
-        response = _json_request(
-            "https://accounts.feishu.cn/oauth/v3/token",
-            method="POST",
-            payload={
-                "grant_type": "authorization_code",
-                "client_id": self.feishu_app_id,
-                "client_secret": self.feishu_app_secret,
-                "code": code,
-                "redirect_uri": self.feishu_redirect_uri,
-            },
-        )
-        if response.get("code") not in (None, 0) or not response.get("access_token"):
-            raise RuntimeError(f"feishu_oauth_error_{response.get('code', 'unknown')}")
-        return response
-
-    def fetch_feishu_user(self, access_token: str) -> dict[str, Any]:
-        response = _json_request(
-            "https://open.feishu.cn/open-apis/authen/v1/user_info",
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        if response.get("code") != 0 or not isinstance(response.get("data"), dict):
-            raise RuntimeError(f"feishu_user_error_{response.get('code', 'unknown')}")
-        return response["data"]
+    def create_session(
+        self,
+        token: dict[str, Any],
+        principal: dict[str, Any],
+    ) -> str:
+        handle = secrets.token_urlsafe(48)
+        now = int(time.time())
+        with open_db(self.db_path) as connection:
+            connection.execute(
+                """
+                DELETE FROM oauth_sessions
+                WHERE absolute_expires_at <= ? OR idle_expires_at <= ?
+                """,
+                (now, now),
+            )
+            connection.execute(
+                """
+                INSERT INTO oauth_sessions (
+                    session_hash, access_token, refresh_token, access_expires_at,
+                    principal_json, validated_at, created_at, last_seen_at,
+                    idle_expires_at, absolute_expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    self._handle_hash(handle),
+                    str(token["access_token"]),
+                    str(token["refresh_token"]),
+                    now + int(token["expires_in"]),
+                    json.dumps(principal, ensure_ascii=False, separators=(",", ":")),
+                    now,
+                    now,
+                    now,
+                    now + self.session_idle_seconds,
+                    now + self.session_absolute_seconds,
+                ),
+            )
+        return handle
 
     def resolve_session(self, raw_cookie: str) -> dict[str, Any] | None:
-        session = self.parse_session_cookie(raw_cookie)
-        if session is None:
+        handle = self._cookie_value(raw_cookie, SESSION_COOKIE_NAME)
+        if not handle:
             return None
-        user = self.access.resolve_user(
-            str(session.get("open_id") or ""),
-            union_id=str(session.get("union_id") or ""),
-            fallback_name=str(session.get("name") or ""),
-        )
-        if user is None:
-            return None
-        return {**user, "csrf": str(session["csrf"]), "exp": int(session["exp"])}
+        session_hash = self._handle_hash(handle)
+        required_scopes = set(self.auth_scopes)
+        now = int(time.time())
+        with self.oauth_lock:
+            if session_hash in self.invalid_session_hashes:
+                try:
+                    with open_db(self.db_path) as connection:
+                        connection.execute(
+                            "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                            (session_hash,),
+                        )
+                except sqlite3.Error:
+                    pass
+                return None
+            with open_db(self.db_path) as connection:
+                row = connection.execute(
+                    "SELECT * FROM oauth_sessions WHERE session_hash = ?",
+                    (session_hash,),
+                ).fetchone()
+            if row is None:
+                return None
+            if now >= int(row["idle_expires_at"]) or now >= int(
+                row["absolute_expires_at"]
+            ):
+                with open_db(self.db_path) as connection:
+                    connection.execute(
+                        "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                        (session_hash,),
+                    )
+                return None
 
-    def start_directory_sync(self, actor_open_id: str) -> bool:
-        if self.feishu_client is None or not self.oauth_is_configured:
-            raise RuntimeError("feishu_directory_not_configured")
-        if not self.access.begin_sync():
-            return False
+            access_token = str(row["access_token"])
+            refresh_token = str(row["refresh_token"])
+            access_expires_at = int(row["access_expires_at"])
+            validated_at = int(row["validated_at"])
+            principal_json = str(row["principal_json"])
+            token_update: dict[str, Any] | None = None
 
-        def run() -> None:
-            try:
-                departments, users, memberships = self.feishu_client.fetch_directory()
-                self.access.complete_sync(departments, users, memberships)
-                print(
-                    json.dumps(
-                        {
-                            "time": utc_now(),
-                            "event": "feishu_directory_sync_completed",
-                            "departments": len(departments),
-                            "users": len(users),
-                            "actor": actor_open_id,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    flush=True,
+            if access_expires_at <= now + REFRESH_SKEW_SECONDS:
+                try:
+                    token_update = validate_token_response(
+                        self.auth_client.refresh(refresh_token),
+                        required_scopes,
+                    )
+                except CentralAuthInvalidGrant:
+                    with open_db(self.db_path) as connection:
+                        connection.execute(
+                            "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                            (session_hash,),
+                        )
+                    return None
+                except CentralAuthRejected as exc:
+                    raise CentralAuthUnavailable("refresh_contract_failed") from exc
+                access_token = str(token_update["access_token"])
+                try:
+                    with open_db(self.db_path) as connection:
+                        cursor = connection.execute(
+                            """
+                            UPDATE oauth_sessions
+                            SET access_token = ?, refresh_token = ?, access_expires_at = ?,
+                                validated_at = 0
+                            WHERE session_hash = ? AND refresh_token = ?
+                            """,
+                            (
+                                access_token,
+                                str(token_update["refresh_token"]),
+                                now + int(token_update["expires_in"]),
+                                session_hash,
+                                refresh_token,
+                            ),
+                        )
+                except sqlite3.Error as exc:
+                    self.invalid_session_hashes.add(session_hash)
+                    raise CentralAuthUnavailable("session_refresh_persist_failed") from exc
+                if cursor.rowcount != 1:
+                    self.invalid_session_hashes.add(session_hash)
+                    raise CentralAuthUnavailable("session_refresh_conflict")
+
+            if token_update is not None or now - validated_at >= self.introspection_cache_seconds:
+                try:
+                    principal = validate_introspection(
+                        self.auth_client.introspect(access_token),
+                        client_id=self.auth_client_id,
+                        required_scopes=required_scopes,
+                    )
+                except CentralAuthRejected:
+                    with open_db(self.db_path) as connection:
+                        connection.execute(
+                            "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                            (session_hash,),
+                        )
+                    return None
+                principal_json = json.dumps(
+                    principal, ensure_ascii=False, separators=(",", ":")
                 )
-            except Exception as exc:
-                reason = str(exc)[:512]
-                self.access.fail_sync(reason)
-                print(
-                    json.dumps(
-                        {
-                            "time": utc_now(),
-                            "event": "feishu_directory_sync_failed",
-                            "reason": reason,
-                        },
-                        ensure_ascii=False,
-                    ),
-                    file=sys.stderr,
-                    flush=True,
-                )
+                validated_at = now
+            else:
+                try:
+                    principal = json.loads(principal_json)
+                except json.JSONDecodeError:
+                    with open_db(self.db_path) as connection:
+                        connection.execute(
+                            "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                            (session_hash,),
+                        )
+                    return None
 
-        with self.directory_thread_lock:
-            self.directory_thread = threading.Thread(
-                target=run,
-                name="feishu-directory-sync",
-                daemon=True,
+            idle_expires_at = min(
+                now + self.session_idle_seconds,
+                int(row["absolute_expires_at"]),
             )
-            self.directory_thread.start()
-        return True
+            with open_db(self.db_path) as connection:
+                connection.execute(
+                    """
+                    UPDATE oauth_sessions
+                    SET principal_json = ?, validated_at = ?, last_seen_at = ?,
+                        idle_expires_at = ?
+                    WHERE session_hash = ?
+                    """,
+                    (principal_json, validated_at, now, idle_expires_at, session_hash),
+                )
+        return principal
+
+    def logout_session(self, raw_cookie: str) -> None:
+        handle = self._cookie_value(raw_cookie, SESSION_COOKIE_NAME)
+        if not handle:
+            return
+        session_hash = self._handle_hash(handle)
+        with self.oauth_lock:
+            with open_db(self.db_path) as connection:
+                row = connection.execute(
+                    "SELECT refresh_token FROM oauth_sessions WHERE session_hash = ?",
+                    (session_hash,),
+                ).fetchone()
+            if row is None:
+                return
+            try:
+                self.auth_client.revoke(str(row["refresh_token"]))
+            except CentralAuthInvalidGrant:
+                pass
+            with open_db(self.db_path) as connection:
+                connection.execute(
+                    "DELETE FROM oauth_sessions WHERE session_hash = ?",
+                    (session_hash,),
+                )
 
     def _load_message(self, row_id: int) -> dict[str, Any] | None:
         with open_db(self.db_path) as connection:
@@ -816,8 +894,6 @@ class RelayServer(ThreadingHTTPServer):
         self.notification_event.set()
         if self.notification_thread and self.notification_thread is not threading.current_thread():
             self.notification_thread.join(timeout=2)
-        if self.directory_thread and self.directory_thread is not threading.current_thread():
-            self.directory_thread.join(timeout=2)
         super().server_close()
 
 
@@ -855,7 +931,10 @@ class RelayHandler(BaseHTTPRequestHandler):
         )
 
     def send_json(
-        self, status: int, payload: dict[str, Any], headers: dict[str, str] | None = None
+        self,
+        status: int,
+        payload: dict[str, Any],
+        headers: dict[str, str | list[str]] | None = None,
     ) -> None:
         body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
@@ -863,19 +942,29 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
+        self._send_extra_headers(headers)
         self.send_security_headers()
         self.end_headers()
         self.wfile.write(body)
 
-    def redirect(self, location: str, headers: dict[str, str] | None = None) -> None:
+    def _send_extra_headers(
+        self, headers: dict[str, str | list[str]] | None
+    ) -> None:
+        for name, value in (headers or {}).items():
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                self.send_header(name, item)
+
+    def redirect(
+        self,
+        location: str,
+        headers: dict[str, str | list[str]] | None = None,
+    ) -> None:
         self.send_response(HTTPStatus.FOUND)
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.send_header("Cache-Control", "no-store")
-        for name, value in (headers or {}).items():
-            self.send_header(name, value)
+        self._send_extra_headers(headers)
         self.send_security_headers()
         self.end_headers()
 
@@ -912,42 +1001,18 @@ class RelayHandler(BaseHTTPRequestHandler):
     def session_user(self) -> dict[str, Any] | None:
         return self.server.resolve_session(self.headers.get("Cookie", ""))
 
-    def require_admin(self) -> dict[str, Any] | None:
-        user = self.session_user()
-        if user is None:
-            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
-            return None
-        if user.get("role") != "admin":
-            self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "forbidden"})
-            return None
-        return user
-
-    def require_csrf(self, user: dict[str, Any]) -> bool:
-        supplied = self.headers.get("X-CSRF-Token", "")
-        expected = str(user.get("csrf") or "")
-        if supplied and expected and hmac.compare_digest(supplied, expected):
-            return True
-        self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid_csrf_token"})
-        return False
-
-    def read_json_body(self) -> Any:
-        content_type = self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
-        if content_type != "application/json":
-            raise ValueError("content_type_must_be_application_json")
-        try:
-            content_length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as exc:
-            raise ValueError("invalid_body_size") from exc
-        if content_length <= 0 or content_length > MAX_BODY_BYTES:
-            raise ValueError("invalid_body_size")
-        try:
-            return json.loads(self.rfile.read(content_length).decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("invalid_json") from exc
-
     def require_read_auth(self) -> bool:
-        if self.api_key_is_valid(self.server.read_api_key) or self.session_user() is not None:
+        if self.api_key_is_valid(self.server.read_api_key):
             return True
+        try:
+            if self.session_user() is not None:
+                return True
+        except CentralAuthUnavailable:
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": "authorization_service_unavailable"},
+            )
+            return False
         self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
         return False
 
@@ -958,72 +1023,129 @@ class RelayHandler(BaseHTTPRequestHandler):
         return False
 
     def handle_oauth_login(self) -> None:
-        if not self.server.oauth_is_configured:
+        state, verifier, browser_binding = self.server.create_oauth_transaction()
+        challenge = _base64url_encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        try:
+            location = self.server.auth_client.authorization_url(state, challenge)
+        except CentralAuthError:
             self.send_json(
                 HTTPStatus.SERVICE_UNAVAILABLE,
-                {"ok": False, "error": "feishu_oauth_not_configured"},
+                {"ok": False, "error": "authorization_service_unavailable"},
             )
             return
-        state, _ = self.server.create_oauth_state()
-        location = "https://accounts.feishu.cn/open-apis/authen/v1/authorize?" + urlencode(
-            {
-                "client_id": self.server.feishu_app_id,
-                "response_type": "code",
-                "redirect_uri": self.server.feishu_redirect_uri,
-                "state": state,
-            }
+        self.redirect(
+            location,
+            {"Set-Cookie": self.server.transaction_set_cookie(browser_binding)},
         )
-        self.redirect(location)
 
     def handle_oauth_callback(self, query: dict[str, list[str]]) -> None:
+        if any(len(values) != 1 for values in query.values()):
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "duplicate_oauth_parameter"},
+            )
+            return
         state = query.get("state", [""])[0]
-        verifier = self.server.consume_oauth_state(state)
+        browser_binding = self.server._cookie_value(
+            self.headers.get("Cookie", ""), OAUTH_TRANSACTION_COOKIE_NAME
+        )
+        verifier = self.server.consume_oauth_transaction(state, browser_binding)
         if verifier is None:
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_oauth_state"})
             return
-        if query.get("error"):
-            self.redirect("./?login_error=access_denied")
+        clear_transaction = {"Set-Cookie": self.server.transaction_clear_cookie()}
+        if query.get("iss", [""])[0] != self.server.auth_issuer:
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "invalid_oauth_issuer"},
+                clear_transaction,
+            )
+            return
+        oauth_error = query.get("error", [""])[0]
+        if oauth_error:
+            if oauth_error != "access_denied":
+                self.send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"ok": False, "error": "oauth_request_rejected"},
+                    clear_transaction,
+                )
+                return
+            self.redirect(
+                self.server.auth_success_uri + "?login_error=access_denied",
+                clear_transaction,
+            )
             return
         code = query.get("code", [""])[0]
         if not code:
-            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "missing_oauth_code"})
+            self.send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"ok": False, "error": "missing_oauth_code"},
+                clear_transaction,
+            )
             return
+        token: dict[str, Any] | None = None
         try:
-            token = self.server.exchange_feishu_code(code)
-            user = self.server.fetch_feishu_user(str(token["access_token"]))
-        except RuntimeError as exc:
-            safe_reason = re.sub(
-                r"(?i)(access_token|refresh_token|client_secret|code(?:_verifier)?)[^,}\s]*",
-                r"\1=<redacted>",
-                str(exc),
-            )[:512]
+            token = validate_token_response(
+                self.server.auth_client.exchange_code(code, verifier),
+                set(self.server.auth_scopes),
+            )
+            principal = validate_introspection(
+                self.server.auth_client.introspect(str(token["access_token"])),
+                client_id=self.server.auth_client_id,
+                required_scopes=set(self.server.auth_scopes),
+            )
+        except CentralAuthUnavailable:
+            self._revoke_failed_login_token(token)
             print(
                 json.dumps(
-                    {"time": utc_now(), "event": "feishu_oauth_failed", "reason": safe_reason},
+                    {"time": utc_now(), "event": "central_oauth_unavailable"},
                     ensure_ascii=False,
                 ),
                 file=sys.stderr,
                 flush=True,
             )
-            self.send_json(HTTPStatus.BAD_GATEWAY, {"ok": False, "error": "feishu_oauth_failed"})
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": "authorization_service_unavailable"},
+                clear_transaction,
+            )
             return
-        open_id = str(user.get("open_id", ""))
-        union_id = str(user.get("union_id") or "")
-        name = str(user.get("name") or "飞书用户")[:128]
-        authorized = self.server.access.resolve_user(
-            open_id,
-            union_id=union_id,
-            fallback_name=name,
-        )
-        if authorized is None:
-            self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "user_not_allowed"})
+        except CentralAuthRejected:
+            self._revoke_failed_login_token(token)
+            self.send_json(
+                HTTPStatus.FORBIDDEN,
+                {"ok": False, "error": "central_authorization_rejected"},
+                clear_transaction,
+            )
             return
-        self.server.access.record_login(open_id, union_id, name)
-        root_url = self.server.feishu_redirect_uri.rsplit("auth/callback", 1)[0]
+        try:
+            handle = self.server.create_session(token, principal)
+        except sqlite3.Error:
+            self._revoke_failed_login_token(token)
+            self.send_json(
+                HTTPStatus.SERVICE_UNAVAILABLE,
+                {"ok": False, "error": "session_store_unavailable"},
+                clear_transaction,
+            )
+            return
         self.redirect(
-            root_url,
-            {"Set-Cookie": self.server.session_set_cookie(open_id, name, union_id)},
+            self.server.auth_success_uri,
+            {
+                "Set-Cookie": [
+                    self.server.transaction_clear_cookie(),
+                    self.server.session_set_cookie(handle),
+                ]
+            },
         )
+
+    def _revoke_failed_login_token(self, token: dict[str, Any] | None) -> None:
+        refresh_token = str((token or {}).get("refresh_token") or "")
+        if not refresh_token:
+            return
+        try:
+            self.server.auth_client.revoke(refresh_token)
+        except CentralAuthError:
+            pass
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
@@ -1042,10 +1164,17 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.handle_oauth_login()
             return
         if parsed.path == "/auth/callback":
-            self.handle_oauth_callback(parse_qs(parsed.query))
+            self.handle_oauth_callback(parse_qs(parsed.query, keep_blank_values=True))
             return
         if parsed.path == "/auth/session":
-            user = self.session_user()
+            try:
+                user = self.session_user()
+            except CentralAuthUnavailable:
+                self.send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": "authorization_service_unavailable"},
+                )
+                return
             if user is None:
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
             else:
@@ -1054,57 +1183,13 @@ class RelayHandler(BaseHTTPRequestHandler):
                     {
                         "ok": True,
                         "user": {
-                            "open_id": user["open_id"],
+                            "subject": user["subject"],
+                            "open_id": user.get("open_id", ""),
                             "name": user["name"],
-                            "role": user["role"],
                         },
-                        "csrf_token": user["csrf"],
+                        "authentication": "central_oauth",
                     },
                 )
-            return
-        if parsed.path == "/v1/admin/directory":
-            user = self.require_admin()
-            if user is None:
-                return
-            snapshot = self.server.access.directory_snapshot()
-            auto_sync_started = False
-            if not snapshot["departments"] and snapshot["sync"]["status"] != "running":
-                try:
-                    auto_sync_started = self.server.start_directory_sync(str(user["open_id"]))
-                    snapshot = self.server.access.directory_snapshot()
-                except RuntimeError as exc:
-                    self.server.access.fail_sync(str(exc))
-                    snapshot = self.server.access.directory_snapshot()
-            self.send_json(
-                HTTPStatus.OK,
-                {"ok": True, **snapshot, "auto_sync_started": auto_sync_started},
-            )
-            return
-        if parsed.path == "/v1/admin/directory/users":
-            if self.require_admin() is None:
-                return
-            query = parse_qs(parsed.query, keep_blank_values=True)
-            try:
-                limit = int(query.get("limit", ["100"])[0])
-                offset = int(query.get("offset", ["0"])[0])
-            except ValueError:
-                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_query"})
-                return
-            result = self.server.access.list_users(
-                department_id=str(query.get("department_id", [""])[0]),
-                query=str(query.get("query", [""])[0]),
-                limit=limit,
-                offset=offset,
-            )
-            self.send_json(HTTPStatus.OK, {"ok": True, **result})
-            return
-        if parsed.path == "/v1/admin/access":
-            if self.require_admin() is None:
-                return
-            self.send_json(
-                HTTPStatus.OK,
-                {"ok": True, **self.server.access.access_summary()},
-            )
             return
         if parsed.path == "/v1/platforms/identify":
             if not self.require_read_auth():
@@ -1181,33 +1266,18 @@ class RelayHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
         if parsed.path == "/auth/logout":
+            try:
+                self.server.logout_session(self.headers.get("Cookie", ""))
+            except CentralAuthError:
+                self.send_json(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    {"ok": False, "error": "authorization_service_unavailable"},
+                )
+                return
             self.send_json(
                 HTTPStatus.OK,
                 {"ok": True},
                 {"Set-Cookie": self.server.session_clear_cookie()},
-            )
-            return
-        if parsed.path == "/v1/admin/directory/sync":
-            user = self.require_admin()
-            if user is None or not self.require_csrf(user):
-                return
-            try:
-                started = self.server.start_directory_sync(str(user["open_id"]))
-            except RuntimeError as exc:
-                self.send_json(
-                    HTTPStatus.SERVICE_UNAVAILABLE,
-                    {"ok": False, "error": str(exc)},
-                )
-                return
-            if not started:
-                self.send_json(
-                    HTTPStatus.CONFLICT,
-                    {"ok": False, "error": "directory_sync_already_running"},
-                )
-                return
-            self.send_json(
-                HTTPStatus.ACCEPTED,
-                {"ok": True, "status": "running"},
             )
             return
         if parsed.path != "/v1/messages":
@@ -1321,51 +1391,7 @@ class RelayHandler(BaseHTTPRequestHandler):
         )
 
     def do_PUT(self) -> None:  # noqa: N802
-        parsed = urlsplit(self.path)
-        if parsed.path != "/v1/admin/access":
-            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
-            return
-        user = self.require_admin()
-        if user is None or not self.require_csrf(user):
-            return
-        try:
-            payload = self.read_json_body()
-            if not isinstance(payload, dict):
-                raise ValueError("JSON body must be an object")
-            department_ids = payload.get("department_ids", [])
-            user_open_ids = payload.get("user_open_ids", [])
-            revision = payload.get("revision")
-            if not isinstance(department_ids, list) or not isinstance(user_open_ids, list):
-                raise ValueError("access subjects must be arrays")
-            if isinstance(revision, bool) or not isinstance(revision, int):
-                raise ValueError("revision must be an integer")
-            result = self.server.access.replace_grants(
-                department_ids=[str(value) for value in department_ids],
-                user_open_ids=[str(value) for value in user_open_ids],
-                expected_revision=revision,
-                actor_open_id=str(user["open_id"]),
-            )
-        except AccessConflictError:
-            self.send_json(
-                HTTPStatus.CONFLICT,
-                {"ok": False, "error": "access_revision_conflict"},
-            )
-            return
-        except InvalidAccessSubjectError as exc:
-            self.send_json(
-                HTTPStatus.BAD_REQUEST,
-                {"ok": False, "error": str(exc)},
-            )
-            return
-        except ValueError as exc:
-            status = (
-                HTTPStatus.UNSUPPORTED_MEDIA_TYPE
-                if str(exc) == "content_type_must_be_application_json"
-                else HTTPStatus.BAD_REQUEST
-            )
-            self.send_json(status, {"ok": False, "error": str(exc)})
-            return
-        self.send_json(HTTPStatus.OK, {"ok": True, **result})
+        self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
 
 def main() -> None:
@@ -1374,49 +1400,52 @@ def main() -> None:
     db_path = os.environ.get("SMS_RELAY_DB_PATH", "/data/sms-relay.db")
     host = os.environ.get("SMS_RELAY_HOST", "0.0.0.0")
     port = int(os.environ.get("SMS_RELAY_PORT", "8000"))
-    session_secret = os.environ.get("SMS_RELAY_SESSION_SECRET", "")
     feishu_app_id = os.environ.get("FEISHU_APP_ID", "")
     feishu_app_secret = os.environ.get("FEISHU_APP_SECRET", "")
-    feishu_redirect_uri = os.environ.get("FEISHU_REDIRECT_URI", "")
     feishu_chat_id = os.environ.get("FEISHU_CHAT_ID", "")
-    legacy_allowed_open_ids = {
-        value.strip()
-        for value in os.environ.get("FEISHU_ALLOWED_OPEN_IDS", "").split(",")
-        if value.strip()
-    }
-    admin_open_ids = {
-        value.strip()
-        for value in os.environ.get("FEISHU_ADMIN_OPEN_IDS", "").split(",")
-        if value.strip()
-    } or legacy_allowed_open_ids
-    admin_union_ids = {
-        value.strip()
-        for value in os.environ.get("FEISHU_ADMIN_UNION_IDS", "").split(",")
-        if value.strip()
-    }
-    if any((feishu_app_id, feishu_app_secret, feishu_redirect_uri)) and not all(
-        (
-            feishu_app_id,
-            feishu_app_secret,
-            feishu_redirect_uri,
-            session_secret,
-            admin_open_ids or admin_union_ids,
-        )
-    ):
-        raise ValueError("Feishu OAuth configuration is incomplete")
+    if bool(feishu_app_id) != bool(feishu_app_secret):
+        raise ValueError("Feishu bot credentials must be configured together")
+    if feishu_chat_id and not (feishu_app_id and feishu_app_secret):
+        raise ValueError("FEISHU_CHAT_ID requires Feishu bot credentials")
+    auth_scope_text = os.environ.get("AUTH_SCOPES", "sms-relay:access")
+    auth_scopes = tuple(
+        value for value in auth_scope_text.replace(",", " ").split() if value
+    )
     server = RelayServer(
         (host, port),
         api_key,
         db_path,
         read_api_key=read_api_key,
-        session_secret=session_secret or api_key,
         feishu_app_id=feishu_app_id,
         feishu_app_secret=feishu_app_secret,
-        feishu_redirect_uri=feishu_redirect_uri,
         feishu_chat_id=feishu_chat_id,
-        admin_open_ids=admin_open_ids,
-        admin_union_ids=admin_union_ids,
+        auth_issuer=os.environ.get(
+            "AUTH_ISSUER", "https://auth.midi.lizhijian.xyz"
+        ),
+        auth_client_id=os.environ.get("AUTH_CLIENT_ID", "sms-relay-web"),
+        auth_audience=os.environ.get("AUTH_AUDIENCE", "sms-relay-api"),
+        auth_scopes=auth_scopes,
+        auth_redirect_uri=os.environ.get(
+            "AUTH_REDIRECT_URI",
+            "https://api.midi.lizhijian.xyz/sms-relay/auth/callback",
+        ),
+        auth_post_logout_redirect_uri=os.environ.get(
+            "AUTH_POST_LOGOUT_REDIRECT_URI",
+            "https://api.midi.lizhijian.xyz/sms-relay/?auto_sso=off",
+        ),
+        auth_backchannel_ip=os.environ.get("AUTH_BACKCHANNEL_IP", ""),
         public_cookie_path=os.environ.get("SMS_RELAY_COOKIE_PATH", "/sms-relay/"),
+        session_idle_seconds=int(
+            os.environ.get("AUTH_SESSION_IDLE_SECONDS", str(SESSION_IDLE_SECONDS))
+        ),
+        session_absolute_seconds=int(
+            os.environ.get(
+                "AUTH_SESSION_ABSOLUTE_SECONDS", str(SESSION_ABSOLUTE_SECONDS)
+            )
+        ),
+        introspection_cache_seconds=int(
+            os.environ.get("AUTH_INTROSPECTION_CACHE_SECONDS", "5")
+        ),
     )
     print(
         json.dumps(
@@ -1425,9 +1454,10 @@ def main() -> None:
                 "host": host,
                 "port": port,
                 "db_path": db_path,
-                "feishu_oauth": server.oauth_is_configured,
+                "authentication": "central_oauth",
+                "auth_issuer": server.auth_issuer,
+                "auth_client_id": server.auth_client_id,
                 "feishu_push": server.notifier is not None,
-                "configured_admins": len(admin_open_ids) + len(admin_union_ids),
             }
         ),
         flush=True,

@@ -8,19 +8,24 @@ services:
     environment:
       SMS_RELAY_API_KEY: ${SMS_RELAY_API_KEY:?SMS_RELAY_API_KEY is required}
       SMS_RELAY_READ_API_KEY: ${SMS_RELAY_READ_API_KEY:?SMS_RELAY_READ_API_KEY is required}
-      SMS_RELAY_SESSION_SECRET: ${SMS_RELAY_SESSION_SECRET:?SMS_RELAY_SESSION_SECRET is required}
       SMS_RELAY_DB_PATH: /data/sms-relay.db
       SMS_RELAY_HOST: 0.0.0.0
       SMS_RELAY_PORT: "8000"
       SMS_RELAY_COOKIE_PATH: ${SMS_RELAY_COOKIE_PATH:-/sms-relay/}
-      FEISHU_APP_ID: ${FEISHU_APP_ID:?FEISHU_APP_ID is required}
-      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:?FEISHU_APP_SECRET is required}
-      FEISHU_REDIRECT_URI: ${FEISHU_REDIRECT_URI:?FEISHU_REDIRECT_URI is required}
+      AUTH_ISSUER: ${AUTH_ISSUER:-https://auth.midi.lizhijian.xyz}
+      AUTH_CLIENT_ID: ${AUTH_CLIENT_ID:-sms-relay-web}
+      AUTH_AUDIENCE: ${AUTH_AUDIENCE:-sms-relay-api}
+      AUTH_SCOPES: ${AUTH_SCOPES:-sms-relay:access}
+      AUTH_REDIRECT_URI: ${AUTH_REDIRECT_URI:-https://api.midi.lizhijian.xyz/sms-relay/auth/callback}
+      AUTH_POST_LOGOUT_REDIRECT_URI: ${AUTH_POST_LOGOUT_REDIRECT_URI:-https://api.midi.lizhijian.xyz/sms-relay/?auto_sso=off}
+      AUTH_BACKCHANNEL_IP: ${AUTH_BACKCHANNEL_IP:-}
+      AUTH_SESSION_IDLE_SECONDS: ${AUTH_SESSION_IDLE_SECONDS:-43200}
+      AUTH_SESSION_ABSOLUTE_SECONDS: ${AUTH_SESSION_ABSOLUTE_SECONDS:-604800}
+      AUTH_INTROSPECTION_CACHE_SECONDS: ${AUTH_INTROSPECTION_CACHE_SECONDS:-5}
+      # Optional Feishu bot credentials. They are never used for browser login.
+      FEISHU_APP_ID: ${FEISHU_APP_ID:-}
+      FEISHU_APP_SECRET: ${FEISHU_APP_SECRET:-}
       FEISHU_CHAT_ID: ${FEISHU_CHAT_ID:-}
-      FEISHU_ADMIN_OPEN_IDS: ${FEISHU_ADMIN_OPEN_IDS:-}
-      FEISHU_ADMIN_UNION_IDS: ${FEISHU_ADMIN_UNION_IDS:-}
-      # Backward-compatible bootstrap source; migrate existing deployments gradually.
-      FEISHU_ALLOWED_OPEN_IDS: ${FEISHU_ALLOWED_OPEN_IDS:-}
     ports:
       - "${SMS_RELAY_BIND_ADDRESS:-127.0.0.1}:${SMS_RELAY_BIND_PORT:-8000}:8000"
     volumes:

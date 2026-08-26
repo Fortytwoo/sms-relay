@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -17,22 +18,101 @@ from app import (
     identify_platform,
     parse_sim_info,
 )
+from central_auth import CentralAuthUnavailable
 
 
 WRITE_API_KEY = "a" * 64
 READ_API_KEY = "b" * 64
 
 
+class FakeCentralAuth:
+    issuer = "https://auth.example.test"
+    client_id = "sms-relay-web"
+    audience = "sms-relay-api"
+    scopes = ("sms-relay:access",)
+    redirect_uri = "https://relay.example.test/sms-relay/auth/callback"
+    post_logout_redirect_uri = (
+        "https://relay.example.test/sms-relay/?auto_sso=off"
+    )
+
+    def __init__(self) -> None:
+        self.exchange_calls: list[tuple[str, str]] = []
+        self.introspect_calls: list[str] = []
+        self.refresh_calls: list[str] = []
+        self.revoke_calls: list[str] = []
+        self.revoke_error: Exception | None = None
+        self.introspection = {
+            "active": True,
+            "principal": {
+                "id": "union-test",
+                "unionId": "union-test",
+                "openId": "ou_test",
+                "clientId": self.client_id,
+                "scopes": ["sms-relay:access"],
+                "name": "测试用户",
+            },
+        }
+
+    def authorization_url(self, state: str, code_challenge: str) -> str:
+        return self.issuer + "/oauth/authorize?" + urllib.parse.urlencode(
+            {
+                "response_type": "code",
+                "client_id": self.client_id,
+                "redirect_uri": self.redirect_uri,
+                "scope": " ".join(self.scopes),
+                "state": state,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+            }
+        )
+
+    def exchange_code(self, code: str, verifier: str) -> dict:
+        self.exchange_calls.append((code, verifier))
+        return {
+            "access_token": "central-access-token",
+            "refresh_token": "central-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "sms-relay:access",
+        }
+
+    def introspect(self, access_token: str) -> dict:
+        self.introspect_calls.append(access_token)
+        return self.introspection
+
+    def refresh(self, refresh_token: str) -> dict:
+        self.refresh_calls.append(refresh_token)
+        return {
+            "access_token": "rotated-access-token",
+            "refresh_token": "rotated-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "sms-relay:access",
+        }
+
+    def revoke(self, refresh_token: str) -> None:
+        self.revoke_calls.append(refresh_token)
+        if self.revoke_error is not None:
+            raise self.revoke_error
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class RelayApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
-        db_path = str(Path(self.temp_dir.name) / "relay.db")
+        self.db_path = str(Path(self.temp_dir.name) / "relay.db")
+        self.auth = FakeCentralAuth()
         self.server = RelayServer(
             ("127.0.0.1", 0),
             WRITE_API_KEY,
-            db_path,
+            self.db_path,
             read_api_key=READ_API_KEY,
-            allowed_open_ids={"ou_test"},
+            auth_client=self.auth,
+            introspection_cache_seconds=0,
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -76,6 +156,52 @@ class RelayApiTests(unittest.TestCase):
             headers = {name.lower(): value for name, value in response.headers.items()}
             return response.status, response.read().decode("utf-8"), headers
 
+    def request_raw(
+        self,
+        method: str,
+        path: str,
+        *,
+        cookie: str | None = None,
+    ) -> tuple[int, bytes, object]:
+        headers = {"Cookie": cookie} if cookie else {}
+        request = urllib.request.Request(
+            self.base_url + path, headers=headers, method=method
+        )
+        opener = urllib.request.build_opener(NoRedirect())
+        try:
+            with opener.open(request, timeout=3) as response:
+                return response.status, response.read(), response.headers
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), exc.headers
+
+    def login(self) -> tuple[str, str]:
+        login_status, _, login_headers = self.request_raw("GET", "/auth/login")
+        self.assertEqual(login_status, 302)
+        location = login_headers["Location"]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
+        transaction_cookie = login_headers["Set-Cookie"].split(";", 1)[0]
+        callback = (
+            "/auth/callback?"
+            + urllib.parse.urlencode(
+                {
+                    "code": "test-code",
+                    "state": query["state"][0],
+                    "iss": self.auth.issuer,
+                }
+            )
+        )
+        callback_status, _, callback_headers = self.request_raw(
+            "GET", callback, cookie=transaction_cookie
+        )
+        self.assertEqual(callback_status, 302)
+        cookies = callback_headers.get_all("Set-Cookie")
+        session_cookie = next(
+            value.split(";", 1)[0]
+            for value in cookies
+            if value.startswith("sms_relay_session=") and "Max-Age=0" not in value
+        )
+        return session_cookie, transaction_cookie
+
     def test_health_is_public(self) -> None:
         status, body = self.request("GET", "/health")
         self.assertEqual(status, 200)
@@ -92,7 +218,7 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("短信中转", page)
         self.assertIn('id="feishu-login"', page)
-        self.assertIn("飞书账号登录", page)
+        self.assertIn("统一认证登录", page)
         self.assertIn('id="detail-tag-row"', page)
         self.assertIn('id="detail-phone"', page)
         self.assertEqual(headers["x-frame-options"], "DENY")
@@ -238,7 +364,7 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(body["tag"], "")
         self.assertFalse(body["recognized"])
 
-    def test_feishu_session_can_list_messages_without_api_key(self) -> None:
+    def test_central_oauth_uses_pkce_and_opaque_server_session(self) -> None:
         payload = {
             "type": "sms",
             "from": "10690000",
@@ -246,93 +372,217 @@ class RelayApiTests(unittest.TestCase):
             "sim_info": "SIM1_13900000000",
         }
         self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
-        cookie = self.server.make_session_cookie("ou_test", "测试用户")
+        login_status, _, login_headers = self.request_raw("GET", "/auth/login")
+        self.assertEqual(login_status, 302)
+        location = login_headers["Location"]
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(location).query)
+        self.assertEqual(query["code_challenge_method"], ["S256"])
+        self.assertNotIn("code_verifier", query)
+        self.assertNotIn("central-", login_headers["Set-Cookie"])
+
+        transaction_cookie = login_headers["Set-Cookie"].split(";", 1)[0]
+        callback_path = "/auth/callback?" + urllib.parse.urlencode(
+            {
+                "code": "test-code",
+                "state": query["state"][0],
+                "iss": self.auth.issuer,
+            }
+        )
+        callback_status, _, callback_headers = self.request_raw(
+            "GET", callback_path, cookie=transaction_cookie
+        )
+        self.assertEqual(callback_status, 302)
+        callback_cookies = callback_headers.get_all("Set-Cookie")
+        cookie = next(
+            value.split(";", 1)[0]
+            for value in callback_cookies
+            if value.startswith("sms_relay_session=") and "Max-Age=0" not in value
+        )
+        self.assertNotIn("central-access-token", cookie)
+        self.assertNotIn("central-refresh-token", cookie)
+        self.assertNotIn("ou_test", cookie)
 
         session_status, session = self.request("GET", "/auth/session", cookie=cookie)
         list_status, listed = self.request("GET", "/v1/messages", cookie=cookie)
 
         self.assertEqual(session_status, 200)
         self.assertEqual(session["user"]["name"], "测试用户")
-        self.assertEqual(session["user"]["role"], "admin")
-        self.assertTrue(session["csrf_token"])
+        self.assertEqual(session["authentication"], "central_oauth")
+        self.assertNotIn("csrf_token", session)
         self.assertEqual(list_status, 200)
         self.assertEqual(listed["messages"][0]["verification_code"], "5729")
 
-    def test_admin_access_api_requires_role_csrf_and_revision(self) -> None:
-        self.server.access.complete_sync(
-            [
-                {"department_id": "0", "parent_department_id": "", "name": "企业"},
-                {"department_id": "od_team", "parent_department_id": "0", "name": "测试组"},
-            ],
-            [
-                {"open_id": "ou_test", "name": "管理员"},
-                {"open_id": "ou_member", "name": "普通用户"},
-            ],
-            {("ou_test", "od_team"), ("ou_member", "od_team")},
-        )
-        admin_cookie = self.server.make_session_cookie("ou_test", "管理员")
-        session_status, session = self.request("GET", "/auth/session", cookie=admin_cookie)
-        self.assertEqual(session_status, 200)
-        csrf = session["csrf_token"]
+    def test_callback_rejects_duplicate_issuer_mismatch_binding_and_replay(self) -> None:
+        status, _, headers = self.request_raw("GET", "/auth/login")
+        self.assertEqual(status, 302)
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(headers["Location"]).query)
+        state = query["state"][0]
+        transaction_cookie = headers["Set-Cookie"].split(";", 1)[0]
 
-        missing_csrf_status, _ = self.request(
-            "PUT",
-            "/v1/admin/access",
-            {"revision": 0, "department_ids": [], "user_open_ids": ["ou_member"]},
-            cookie=admin_cookie,
+        duplicate_status, _, _ = self.request_raw(
+            "GET",
+            "/auth/callback?code=a&state=" + state + "&state=second&iss="
+            + urllib.parse.quote(self.auth.issuer, safe=""),
+            cookie=transaction_cookie,
         )
-        save_status, saved = self.request(
-            "PUT",
-            "/v1/admin/access",
-            {"revision": 0, "department_ids": [], "user_open_ids": ["ou_member"]},
-            cookie=admin_cookie,
-            extra_headers={"X-CSRF-Token": csrf},
+        self.assertEqual(duplicate_status, 400)
+
+        mismatch_status, _, _ = self.request_raw(
+            "GET",
+            "/auth/callback?"
+            + urllib.parse.urlencode(
+                {"code": "a", "state": state, "iss": "https://wrong.example"}
+            ),
+            cookie=transaction_cookie,
         )
-        conflict_status, conflict = self.request(
-            "PUT",
-            "/v1/admin/access",
-            {"revision": 0, "department_ids": [], "user_open_ids": []},
-            cookie=admin_cookie,
-            extra_headers={"X-CSRF-Token": csrf},
+        self.assertEqual(mismatch_status, 400)
+
+        status, _, headers = self.request_raw("GET", "/auth/login")
+        state = urllib.parse.parse_qs(
+            urllib.parse.urlsplit(headers["Location"]).query
+        )["state"][0]
+        binding_status, _, _ = self.request_raw(
+            "GET",
+            "/auth/callback?"
+            + urllib.parse.urlencode(
+                {"code": "a", "state": state, "iss": self.auth.issuer}
+            ),
+            cookie="sms_relay_oauth_tx=wrong-browser",
         )
-        member_cookie = self.server.make_session_cookie("ou_member", "普通用户")
-        forbidden_status, forbidden = self.request(
-            "GET", "/v1/admin/access", cookie=member_cookie
+        self.assertEqual(binding_status, 400)
+
+        transaction_cookie = headers["Set-Cookie"].split(";", 1)[0]
+        callback = "/auth/callback?" + urllib.parse.urlencode(
+            {"code": "a", "state": state, "iss": self.auth.issuer}
+        )
+        success_status, _, _ = self.request_raw(
+            "GET", callback, cookie=transaction_cookie
+        )
+        replay_status, _, _ = self.request_raw(
+            "GET", callback, cookie=transaction_cookie
+        )
+        self.assertEqual(success_status, 302)
+        self.assertEqual(replay_status, 400)
+
+    def test_oauth_transaction_is_consumed_once_under_concurrency(self) -> None:
+        state, verifier, browser_binding = self.server.create_oauth_transaction()
+        barrier = threading.Barrier(3)
+        results: list[str | None] = []
+        errors: list[Exception] = []
+
+        def consume() -> None:
+            try:
+                barrier.wait()
+                results.append(
+                    self.server.consume_oauth_transaction(state, browser_binding)
+                )
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=consume) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=3)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results.count(verifier), 1)
+        self.assertEqual(results.count(None), 1)
+
+    def test_introspection_enforces_client_scope_and_active_state(self) -> None:
+        cases = [
+            ({"active": False}, 403),
+            (
+                {
+                    "active": True,
+                    "principal": {
+                        "id": "union-test",
+                        "clientId": "other-client",
+                        "scopes": ["sms-relay:access"],
+                    },
+                },
+                403,
+            ),
+            (
+                {
+                    "active": True,
+                    "principal": {
+                        "id": "union-test",
+                        "clientId": self.auth.client_id,
+                        "scopes": [],
+                    },
+                },
+                403,
+            ),
+        ]
+        for introspection, expected_status in cases:
+            with self.subTest(introspection=introspection):
+                self.auth.introspection = introspection
+                status, _, headers = self.request_raw("GET", "/auth/login")
+                state = urllib.parse.parse_qs(
+                    urllib.parse.urlsplit(headers["Location"]).query
+                )["state"][0]
+                transaction_cookie = headers["Set-Cookie"].split(";", 1)[0]
+                callback_status, _, _ = self.request_raw(
+                    "GET",
+                    "/auth/callback?"
+                    + urllib.parse.urlencode(
+                        {"code": "a", "state": state, "iss": self.auth.issuer}
+                    ),
+                    cookie=transaction_cookie,
+                )
+                self.assertEqual(callback_status, expected_status)
+        self.assertEqual(
+            self.auth.revoke_calls,
+            ["central-refresh-token", "central-refresh-token", "central-refresh-token"],
         )
 
-        self.assertEqual(missing_csrf_status, 403)
-        self.assertEqual(save_status, 200)
-        self.assertEqual(saved["revision"], 1)
-        self.assertEqual(conflict_status, 409)
-        self.assertEqual(conflict["error"], "access_revision_conflict")
-        self.assertEqual(forbidden_status, 403)
-        self.assertEqual(forbidden["error"], "forbidden")
+    def test_refresh_rotates_server_side_token_atomically(self) -> None:
+        cookie, _ = self.login()
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("UPDATE oauth_sessions SET access_expires_at = 0")
+            connection.commit()
+        finally:
+            connection.close()
 
-    def test_revoked_user_session_stops_working_immediately(self) -> None:
-        self.server.access.complete_sync(
-            [{"department_id": "0", "parent_department_id": "", "name": "企业"}],
-            [{"open_id": "ou_member", "name": "普通用户"}],
-            {("ou_member", "0")},
-        )
-        self.server.access.replace_grants(
-            department_ids=[],
-            user_open_ids=["ou_member"],
-            expected_revision=0,
-            actor_open_id="ou_test",
-        )
-        cookie = self.server.make_session_cookie("ou_member", "普通用户")
-        allowed_status, _ = self.request("GET", "/v1/messages", cookie=cookie)
-        self.server.access.replace_grants(
-            department_ids=[],
-            user_open_ids=[],
-            expected_revision=1,
-            actor_open_id="ou_test",
-        )
-        revoked_status, revoked = self.request("GET", "/v1/messages", cookie=cookie)
+        status, _ = self.request("GET", "/auth/session", cookie=cookie)
 
-        self.assertEqual(allowed_status, 200)
+        self.assertEqual(status, 200)
+        self.assertEqual(self.auth.refresh_calls, ["central-refresh-token"])
+        connection = sqlite3.connect(self.db_path)
+        try:
+            row = connection.execute(
+                "SELECT access_token, refresh_token FROM oauth_sessions"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row, ("rotated-access-token", "rotated-refresh-token"))
+
+    def test_logout_revokes_before_deleting_and_fails_closed(self) -> None:
+        cookie, _ = self.login()
+        self.auth.revoke_error = CentralAuthUnavailable("unavailable")
+        failed_status, _, failed_headers = self.request_raw(
+            "POST", "/auth/logout", cookie=cookie
+        )
+        still_valid_status, _ = self.request("GET", "/auth/session", cookie=cookie)
+        self.assertEqual(failed_status, 503)
+        self.assertEqual(failed_headers.get_all("Set-Cookie"), None)
+        self.assertEqual(still_valid_status, 200)
+
+        self.auth.revoke_error = None
+        logout_status, _, logout_headers = self.request_raw(
+            "POST", "/auth/logout", cookie=cookie
+        )
+        revoked_status, _ = self.request("GET", "/auth/session", cookie=cookie)
+        self.assertEqual(logout_status, 200)
+        self.assertEqual(
+            self.auth.revoke_calls,
+            ["central-refresh-token", "central-refresh-token"],
+        )
+        self.assertIn("Max-Age=0", logout_headers["Set-Cookie"])
         self.assertEqual(revoked_status, 401)
-        self.assertEqual(revoked["error"], "unauthorized")
 
     def test_new_verification_message_is_sent_to_feishu_notifier(self) -> None:
         class Recorder:

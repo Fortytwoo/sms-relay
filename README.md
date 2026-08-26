@@ -1,7 +1,7 @@
 # SMS Relay
 
 一个轻量、自托管的短信中转服务。Android 端可通过
-[SmsForwarder](https://github.com/pppscn/SmsForwarder) 把短信发送到服务端；服务端保存短信、自动识别常见验证码，并提供飞书登录的网页收件箱。识别到验证码后，还可以把验证码推送到指定飞书群。
+[SmsForwarder](https://github.com/pppscn/SmsForwarder) 把短信发送到服务端；服务端保存短信、自动识别常见验证码，并提供接入中央 OAuth 的网页收件箱。识别到验证码后，还可以把验证码推送到指定飞书群。
 
 项目只使用 Python 标准库和原生浏览器 API，不依赖 Web 框架或前端构建工具。
 
@@ -12,8 +12,9 @@
 - 自动识别 4–8 位数字或字母数字验证码，保留验证码在短信中的原始大小写；支持登录验证码、快手验证码和导出文件解压密码等常见格式。
 - 自动把短信中第一个非空 `【…】` 签名提取为 `tag`，历史短信无需迁移即可返回标签。
 - 根据受支持后台的 URL 精确识别小红书、快手、丁香、私域商城、微信小店和抖音商城。
-- 飞书 OAuth 登录、管理员与 SQLite 动态访问控制。
-- 从飞书只读同步企业组织架构，支持部门（含全部子部门）和个人授权。
+- 标准 OAuth 2.0 Authorization Code + PKCE `S256`，由中央授权系统统一决定应用入口权限。
+- BFF 服务端 Session：中央 access/refresh token 只保存在 SQLite，浏览器仅持有随机 opaque Cookie。
+- 每次受保护访问执行短缓存 introspection；中央撤权、站点停用或服务不可用时 fail closed。
 - 验证码点击复制，显示接收短信的 SIM 卡槽和手机号。
 - 可选的飞书群验证码通知（包含短信 `tag` 平台标签），失败后后台重试。
 - 响应式中文网页，支持搜索、分页和自动刷新。
@@ -30,7 +31,7 @@ Nginx / Caddy / Traefik
         ▼
 SMS Relay ──────► SQLite
     │
-    ├───────────► Feishu OAuth（网页登录）
+    ├───────────► Central OAuth（网页登录、introspection、refresh、revoke）
     └───────────► Feishu Bot（可选群通知）
 ```
 
@@ -52,10 +53,9 @@ Windows PowerShell 使用：
 Copy-Item .env.example .env
 ```
 
-分别生成三个独立的 64 字符随机值，填入 `.env`：
+分别生成两个独立的 64 字符随机值，填入 `.env`：
 
 ```bash
-uv run python -c "import secrets; print(secrets.token_hex(32))"
 uv run python -c "import secrets; print(secrets.token_hex(32))"
 uv run python -c "import secrets; print(secrets.token_hex(32))"
 ```
@@ -66,27 +66,38 @@ uv run python -c "import secrets; print(secrets.token_hex(32))"
 | --- | --- |
 | `SMS_RELAY_API_KEY` | Android 端写入 API 使用的 64 字符密钥 |
 | `SMS_RELAY_READ_API_KEY` | 外部程序读取短信使用的独立 64 字符密钥 |
-| `SMS_RELAY_SESSION_SECRET` | 签名浏览器会话，必须与两个 API Key 不同 |
-| `FEISHU_APP_ID` | 飞书自建应用 App ID |
-| `FEISHU_APP_SECRET` | 飞书自建应用 App Secret |
-| `FEISHU_REDIRECT_URI` | OAuth 回调完整 URL，例如 `https://relay.example.com/sms-relay/auth/callback` |
-| `FEISHU_ADMIN_OPEN_IDS` | 不可在页面撤销的管理员 Open ID，多个值使用英文逗号分隔 |
-| `FEISHU_ADMIN_UNION_IDS` | 可选；管理员 Union ID，适合跨应用身份审计 |
-| `FEISHU_ALLOWED_OPEN_IDS` | 旧版兼容变量；新部署请留空并使用管理员变量 |
+| `AUTH_ISSUER` | 中央认证 issuer；生产为 `https://auth.midi.lizhijian.xyz` |
+| `AUTH_CLIENT_ID` | 已注册 public client；本项目为 `sms-relay-web` |
+| `AUTH_AUDIENCE` | introspection 固定 audience；本项目为 `sms-relay-api` |
+| `AUTH_SCOPES` | 必须具备的入口 scope；本项目为 `sms-relay:access` |
+| `AUTH_REDIRECT_URI` | 已在中央注册的精确 HTTPS callback URI |
+| `AUTH_POST_LOGOUT_REDIRECT_URI` | 已在中央注册的精确退出后 URI |
+| `AUTH_BACKCHANNEL_IP` | 可选；跨云链路按SNI重置时使用的固定中央认证IP，仍严格校验公开IP SAN证书 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 可选；仅用于群机器人通知，不参与登录 |
 | `FEISHU_CHAT_ID` | 可选；接收验证码通知的群 Chat ID |
 
-### 2. 配置飞书应用
+### 2. 配置中央授权
 
-在飞书开放平台创建企业自建应用：
+SMS Relay 不再直接接入飞书 OAuth，也不在本地维护 Open ID、Union ID、部门或个人登录白名单。中央认证必须预先注册并授权本项目的固定客户端合同：
 
-1. 启用网页 OAuth 登录能力，并把 `FEISHU_REDIRECT_URI` 加入安全重定向 URL。
-2. 开通读取当前登录用户基本信息、通讯录基本信息和部门组织架构所需权限，并把应用通讯录权限范围设为“全部成员”。
-3. 如需群通知，启用机器人和发送群消息权限，把机器人加入目标群，再填写群 Chat ID。
-4. 把初始管理员写入 `FEISHU_ADMIN_OPEN_IDS`。管理员首次进入“权限管理”时会自动启动组织架构同步。
+```text
+issuer:       https://auth.midi.lizhijian.xyz
+client_id:    sms-relay-web
+audience:     sms-relay-api
+scope:        sms-relay:access
+redirect_uri: https://api.midi.lizhijian.xyz/sms-relay/auth/callback
+```
 
-普通用户不再写入环境变量。管理员可在页面勾选部门或人员；部门授权会递归包含全部子部门，并在下一次目录同步完成后自动跟随入职、调岗和离职变化。同步采用新快照事务替换，失败时保留最近一次成功目录。
+中央侧需要先为正式用户或部门建立 grant，再为 `sms-relay-web` 启用动态授权策略。grant 尚未准备时不要直接启用策略，否则普通用户会被默认拒绝。应用只接受中央 introspection 中 `active=true`、`clientId=sms-relay-web` 且 scopes 包含 `sms-relay:access` 的主体，不再执行第二套本地白名单。
 
-飞书 App Secret、用户 Open ID 和群 Chat ID 均不要提交到仓库。
+完整登录、服务端 Session、refresh/revoke、失败关闭语义和上线前置条件见 [docs/AUTHENTICATION.md](docs/AUTHENTICATION.md)。
+
+当前 `ys` 到中央认证公网IP的带SNI TLS会被跨云链路重置。部署到该主机时可设置
+`AUTH_BACKCHANNEL_IP=139.196.114.210`，仅将服务端 metadata/token/introspection/
+revoke传输改为固定IP；浏览器授权URL和OAuth issuer保持域名。该模式不会关闭CA校验，
+详情及抓包边界见上述认证文档。
+
+如需群通知，再在飞书开放平台启用机器人和发送群消息权限，把机器人加入目标群，并填写 `FEISHU_APP_ID`、`FEISHU_APP_SECRET` 和 `FEISHU_CHAT_ID`。这些凭据只用于消息推送，不参与网页登录，也不要提交到仓库。
 
 ### 3. 启动服务
 
@@ -112,7 +123,7 @@ curl http://127.0.0.1:8000/health
 
 - Nginx location 前缀；
 - `.env` 中的 `SMS_RELAY_COOKIE_PATH`；
-- `FEISHU_REDIRECT_URI` 中的回调路径。
+- 中央注册表与 `.env` 中的 `AUTH_REDIRECT_URI`、`AUTH_POST_LOGOUT_REDIRECT_URI`。
 
 应用只应通过 HTTPS 对外服务，因为浏览器会话 Cookie 带有 `Secure` 属性。
 
@@ -163,18 +174,13 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 | --- | --- | --- |
 | `GET /health` | 无 | 只返回存活状态，不返回短信数量 |
 | `POST /v1/messages` | 写入 API Key | 接收一条短信 |
-| `GET /v1/messages?limit=50&before_id=123` | 飞书会话或只读 API Key | 按 ID 倒序分页读取历史短信 |
-| `GET /v1/messages?limit=50&after_id=123` | 飞书会话或只读 API Key | 按 ID 正序获取游标之后的新短信 |
-| `GET /v1/platforms/identify?url=...` | 飞书会话或只读 API Key | 根据页面 URL 返回标准平台 `tag` |
-| `GET /auth/login` | 无 | 发起飞书 OAuth |
-| `GET /auth/callback` | OAuth state | 处理飞书回调 |
-| `GET /auth/session` | 飞书会话 | 返回当前登录用户 |
-| `POST /auth/logout` | 无 | 清除当前浏览器会话 |
-| `GET /v1/admin/directory` | 管理员会话 | 返回本地企业架构和同步状态 |
-| `GET /v1/admin/directory/users` | 管理员会话 | 按部门或姓名分页查询成员 |
-| `POST /v1/admin/directory/sync` | 管理员会话 + CSRF | 后台同步飞书企业架构 |
-| `GET /v1/admin/access` | 管理员会话 | 返回当前部门与个人授权 |
-| `PUT /v1/admin/access` | 管理员会话 + CSRF | 使用版本号原子更新授权 |
+| `GET /v1/messages?limit=50&before_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 倒序分页读取历史短信 |
+| `GET /v1/messages?limit=50&after_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 正序获取游标之后的新短信 |
+| `GET /v1/platforms/identify?url=...` | 中央 OAuth 应用会话或只读 API Key | 根据页面 URL 返回标准平台 `tag` |
+| `GET /auth/login` | 无 | 生成 state/PKCE 并跳转中央认证 |
+| `GET /auth/callback` | OAuth state + issuer + transaction Cookie | 兑换中央 token 并创建 BFF Session |
+| `GET /auth/session` | 中央 OAuth 应用会话 | introspection 后返回当前用户 |
+| `POST /auth/logout` | 应用会话 | 先撤销中央 refresh grant，再清除应用 Session |
 
 写入示例：
 
@@ -261,8 +267,8 @@ node --check web/app.js
 项目结构：
 
 ```text
-app.py                       HTTP API、OAuth、SQLite 与飞书通知
-access_control.py            企业目录快照、授权规则与审计
+app.py                       HTTP API、BFF Session、SQLite 与飞书通知
+central_auth.py              中央 OAuth metadata、PKCE、token、introspection 与 revoke
 web/                         无构建步骤的网页收件箱
 tests/                       标准库 unittest 测试
 android-outbox/              Android 持久化 Outbox、构建脚本与 Magisk systemizer
@@ -273,11 +279,11 @@ nginx-location.conf          HTTPS 反向代理 location 示例
 
 ## 安全说明
 
-- 为写入 Key、只读 Key 与 Session Secret 使用三个独立、随机生成的值。
-- 只配置受信任的飞书管理员，并定期检查页面授权和目标群成员。
-- 权限写入使用 CSRF token 与乐观版本控制；每次浏览器请求都会重新校验当前权限，撤权后旧会话立即失效。
+- 为写入 Key 和只读 Key 使用两个独立、随机生成的 64 字符值。
+- 登录入口权限只在中央授权系统配置；应用不得恢复本地 Union ID/Open ID 白名单形成双策略。
+- 中央 token 只保存在服务端 SQLite，浏览器 Cookie 仅含随机句柄；中央不可用、撤权或 introspection inactive 时拒绝受保护访问。
 - 仅通过 HTTPS 暴露服务，容器端口保持绑定在 loopback。
-- 限制 `data/` 的宿主机文件权限，并制定短信保留和删除策略。
+- 严格限制 `data/` 的宿主机文件权限；数据库同时包含短信与中央 token，并应制定保留、备份和删除策略。
 - 发现凭据误提交时，删除文件并不足够，必须立即轮换对应凭据。
 
 安全问题请参阅 [SECURITY.md](SECURITY.md)。
