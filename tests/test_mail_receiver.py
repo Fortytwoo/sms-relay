@@ -36,6 +36,8 @@ class FakeIMAP:
         self.fail_fetch = False
         self.closed = False
         self.login_calls = 0
+        self.reported_size_delta = 0
+        self.truncate_bytes = 0
 
     def login(self, username, password):
         self.login_calls += 1
@@ -65,8 +67,10 @@ class FakeIMAP:
         uid = int(args[0])
         self.fetches.append(uid)
         raw = self.messages[uid]
-        return "OK", [(f"1 (UID {uid} RFC822.SIZE {len(raw)} BODY[] {{x}})".encode(),
-                       raw[:MAX_MAIL_BYTES + 1]), b")"]
+        reported_size = len(raw) + self.reported_size_delta
+        fetched = raw[:-self.truncate_bytes] if self.truncate_bytes else raw
+        return "OK", [(f"1 (UID {uid} RFC822.SIZE {reported_size} BODY[] {{x}})".encode(),
+                       fetched[:MAX_MAIL_BYTES + 1]), b")"]
 
     def logout(self):
         self.closed = True
@@ -195,6 +199,31 @@ class MailReceiverTests(unittest.TestCase):
         receiver.poll_account(self.account)
         self.assertEqual(len(self.messages()), 1)
         self.assertEqual(receiver.status()[0]["skipped_count"], 1)
+
+    def test_provider_size_underestimate_does_not_block_new_mail(self):
+        self.account = replace(self.account, start_from="all")
+        self.client.messages[1] = raw_mail().as_bytes()
+        # Observed Tencent response: RFC822.SIZE=7761, literal length=7763.
+        self.client.reported_size_delta = -2
+        receiver = self.receiver()
+        receiver.poll_once()
+        self.assertEqual(len(self.messages()), 1)
+        self.assertEqual(enrich_message(self.messages()[0])["verification_code"], "a7C91d")
+        self.assertEqual(receiver.status()[0]["last_error"], "")
+        self.receiver().poll_account(self.account)
+        self.assertEqual(len(self.messages()), 1)
+
+    def test_short_fetch_is_retried_without_advancing_cursor(self):
+        self.account = replace(self.account, start_from="all")
+        self.client.messages[1] = raw_mail().as_bytes()
+        self.client.truncate_bytes = 3
+        receiver = self.receiver()
+        receiver.poll_once()
+        self.assertEqual(self.messages(), [])
+        self.assertEqual(receiver.status()[0]["last_error"], "mailbox_sync_failed")
+        self.client.truncate_bytes = 0
+        receiver.poll_account(self.account)
+        self.assertEqual(len(self.messages()), 1)
 
     def test_plain_html_subject_and_attachments_preserve_case(self):
         html = raw_mail("<head><style>OTP 999999</style></head><p>Your OTP is <b>a7C91d</b></p><script>OTP 111111</script>", html=True)

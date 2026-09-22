@@ -251,7 +251,10 @@ class MailReceiver:
                     skipped += 1
                     self._update(account, last_uid=uid, skipped_count=skipped)
                     continue
-                if len(raw) != int(size[1]):
+                # Tencent may understate RFC822.SIZE (e.g. 7761 vs 7763 bytes).
+                # Extra returned bytes are not truncation; both sizes are already
+                # bounded above. Still reject incomplete partial FETCH responses.
+                if len(raw) < int(size[1]):
                     raise imaplib.IMAP4.error("mail_truncated")
                 source_id = f"imap:{account.state_key}:{validity}:{uid}"
                 self.ingest(parse_email(raw, account, source_id))
