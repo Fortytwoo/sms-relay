@@ -15,6 +15,8 @@ from app import (
     RelayServer,
     extract_message_tag,
     extract_verification_code,
+    extract_email_verification_code,
+    build_verification_card,
     identify_platform,
     parse_sim_info,
 )
@@ -291,6 +293,45 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(payload["mailboxes"][0]["address"], account.address)
         self.assertNotIn("synthetic-secret", json.dumps(payload))
         self.assertNotIn("test-login", json.dumps(payload))
+
+    def test_email_action_code_notifies_once_with_card(self) -> None:
+        calls = []
+        class Client:
+            def request(self, *args, **kwargs):
+                calls.append(kwargs["payload"])
+                return {"code": 0}
+        self.server.notifier = FeishuNotifier("", "", "test-chat", client=Client())
+        payload = {"type": "email", "recipient": "a@example.test", "source_message_id": "new-code",
+                   "subject": "邮箱验证", "content": "请在48小时内输入以下代码完成验证：\n a7C91d"}
+        _, first = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        _, duplicate = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        self.assertEqual(first["lark_push_status"], "sent")
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["msg_type"], "interactive")
+        card = json.loads(calls[0]["content"])
+        button = next(x for x in card["body"]["elements"] if x["tag"] == "button")
+        self.assertTrue(button["behaviors"][0]["default_url"].endswith(f"/copy?message_id={first['id']}"))
+
+    def test_copy_page_and_code_endpoint_enforce_read_authorization(self) -> None:
+        _, stored = self.request("POST", "/v1/messages", {"content": "OTP a7C91d"}, WRITE_API_KEY)
+        path = f"/v1/messages/{stored['id']}/code"
+        for key in (None, WRITE_API_KEY):
+            self.assertEqual(self.request("GET", path, api_key=key)[0], 401)
+        status, payload = self.request("GET", path, api_key=READ_API_KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["message"]["verification_code"], "a7C91d")
+        self.assertNotIn("content", payload["message"])
+        self.assertNotIn("source_ip", payload["message"])
+        self.assertEqual(self.request("GET", "/v1/messages/9999999/code", api_key=READ_API_KEY)[0], 404)
+        cookie, _ = self.login()
+        self.assertEqual(self.request("GET", path, cookie=cookie)[0], 200)
+        self.auth.introspection["active"] = False
+        self.assertEqual(self.request("GET", path, cookie=cookie)[0], 401)
+        status, html, headers = self.request_text(f"/copy?message_id={stored['id']}")
+        self.assertEqual(status, 200)
+        self.assertNotIn("a7C91d", html)
+        self.assertEqual(headers["cache-control"], "no-store")
 
     def test_insert_deduplicates_and_lists_utf8_message(self) -> None:
         payload = {
@@ -927,6 +968,27 @@ class RelayApiTests(unittest.TestCase):
 
 
 class MessageEnrichmentTests(unittest.TestCase):
+    def test_email_verification_action_with_multiline_code(self) -> None:
+        cases = [
+            ("邮箱验证", "请在48小时内输入以下代码完成验证：\r\n \n a7C91d\n客服电话400-601-4321", "a7C91d"),
+            ("邮箱验证", "请使用以下代码完成验证：\nAbCdEf", "AbCdEf"),
+            ("邮箱验证", "输入以下代码完成验证：aB12cD", "aB12cD"),
+            ("帐号登录提醒", "帐号成功登录。登录时间：2026-09-22 17:14:58\n客服电话400-601-4321", ""),
+            ("邮箱验证", "输入以下代码完成验证：\n400-601-4321", ""),
+            ("邮箱验证", "输入以下代码完成验证：\n2026-09-22", ""),
+            ("邮箱验证", "输入以下代码完成验证：\n48小时", ""),
+            ("订单通知", "订单编号123456", ""),
+            ("邮箱验证", "输入以下代码完成验证：\n请联系客服\n123456", ""),
+            ("邮箱验证", "输入以下代码完成验证：\nAb12Cd\n输入以下代码完成验证：\nEf34Gh", ""),
+            ("邮箱验证", "Your OTP is a7C91d", "a7C91d"),
+            ("邮箱验证", "OTP 123456\nOTP 654321", ""),
+            ("邮箱验证", "OTP 123456\nOTP 123456", "123456"),
+        ]
+        for subject, body, expected in cases:
+            with self.subTest(subject=subject, body=body):
+                self.assertEqual(extract_email_verification_code(subject, body), expected)
+        self.assertEqual(extract_verification_code("输入以下代码完成验证：\nAbCdEf"), "")
+
     def test_extracts_first_non_empty_bracket_tag(self) -> None:
         self.assertEqual(
             extract_message_tag("【  小红书  】验证码 123456【登录提醒】"),
@@ -1002,10 +1064,34 @@ class FeishuNotifierTests(unittest.TestCase):
         notifier.send({**base_message, "tag": "小红书"})
         notifier.send({**base_message, "id": 2, "tag": ""})
 
-        tagged_text = json.loads(client.payloads[0]["content"])["text"]
-        untagged_text = json.loads(client.payloads[1]["content"])["text"]
+        self.assertEqual(client.payloads[0]["msg_type"], "interactive")
+        self.assertEqual(client.payloads[0]["uuid"], "sms-relay-1")
+        tagged_text = json.dumps(json.loads(client.payloads[0]["content"]), ensure_ascii=False)
+        untagged_text = json.dumps(json.loads(client.payloads[1]["content"]), ensure_ascii=False)
         self.assertIn("平台：小红书", tagged_text)
         self.assertNotIn("平台：", untagged_text)
+
+    def test_card_has_copyable_code_and_plain_text_email_metadata(self) -> None:
+        card = build_verification_card({"id": 3, "message_type": "email", "verification_code": "a7C91d",
+            "recipient": "account@example.test", "sender": "<at id=all>sender</at>",
+            "subject": "[untrusted](https://example.test)", "content": "private body omitted",
+            "source_received_at": "2026-09-22T10:00:00+08:00"})
+        self.assertEqual(card["schema"], "2.0")
+        elements = card["body"]["elements"]
+        code_elements = [element for element in elements if element["tag"] == "markdown"]
+        self.assertEqual(code_elements, [{"tag": "markdown", "content": "```\na7C91d\n```"}])
+        texts = [element["text"]["content"] for element in elements if element["tag"] == "div"]
+        self.assertIn("接收邮箱：account@example.test", texts)
+        self.assertIn("邮件主题：[untrusted](https://example.test)", texts)
+        self.assertTrue(all(element["text"]["tag"] == "plain_text" for element in elements if element["tag"] == "div"))
+        self.assertNotIn("private body omitted", json.dumps(card))
+        button = next(element for element in elements if element["tag"] == "button")
+        url = button["behaviors"][0]["default_url"]
+        self.assertTrue(url.endswith("/copy?message_id=3"))
+        self.assertNotIn("a7C91d", url)
+        self.assertNotIn("account@example.test", url)
+        sms = build_verification_card({"id": 4, "verification_code": "AbCdEf", "sim_phone": "13800000000"})
+        self.assertIn("接收号码：13800000000", json.dumps(sms, ensure_ascii=False))
 
 
 if __name__ == "__main__":

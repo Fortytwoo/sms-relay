@@ -102,6 +102,8 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?after_id=0&limit=50' 
 
 ## 获取最近短信与历史翻页
 
+飞书验证码卡片的安全复制页使用 `GET /v1/messages/<id>/code`，沿用本节同一只读 Key 或中央 OAuth 会话鉴权。消息不存在返回 `404`，未识别到唯一验证码时 `verification_code` 为空。详情见 [邮件验证码与卡片](EMAIL.md#邮件验证码与飞书卡片)。
+
 不传 `after_id` 时，按 `id` 倒序返回最近短信：
 
 ```bash

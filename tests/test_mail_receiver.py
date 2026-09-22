@@ -256,7 +256,8 @@ class MailReceiverTests(unittest.TestCase):
         notifier = FeishuNotifier("", "", "test-chat", client=Client())
         notifier.send({"id": 1, "message_type": "email", "verification_code": "a7C91d",
                        "recipient": self.account.address, "sender": "source@example.test"})
-        text = json.loads(calls[0]["payload"]["content"])["text"]
+        self.assertEqual(calls[0]["payload"]["msg_type"], "interactive")
+        text = json.dumps(json.loads(calls[0]["payload"]["content"]), ensure_ascii=False)
         self.assertIn("接收邮箱：a@example.test", text)
         self.assertIn("a7C91d", text)
 

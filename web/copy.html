@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>复制验证码 · SMS Relay</title>
+  <link rel="stylesheet" href="assets/copy.css">
+  <script src="assets/copy.js" defer></script>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">SMS RELAY</p>
+    <h1>复制验证码</h1>
+    <p id="status" role="status" aria-live="polite">正在安全读取验证码…</p>
+    <section id="message" hidden>
+      <p id="receiver"></p>
+      <p id="subject"></p>
+      <div id="code" aria-label="验证码"></div>
+      <button id="copy-code" type="button">复制验证码</button>
+    </section>
+    <a id="login" href="auth/login" target="_blank" rel="noopener" hidden>使用统一认证登录</a>
+    <button id="retry" type="button" hidden>重新读取</button>
+    <a class="back" href="./">返回收件箱</a>
+  </main>
+</body>
+</html>

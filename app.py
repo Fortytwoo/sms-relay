@@ -45,6 +45,9 @@ REFRESH_SKEW_SECONDS = 60
 MESSAGE_DEDUPLICATION_WINDOW_SECONDS = 60
 WEB_ROOT = Path(__file__).with_name("web")
 STATIC_FILES = {
+    "/copy": ("copy.html", "text/html; charset=utf-8", "no-store"),
+    "/assets/copy.js": ("copy.js", "text/javascript; charset=utf-8", "no-cache"),
+    "/assets/copy.css": ("copy.css", "text/css; charset=utf-8", "no-cache"),
     "/": ("index.html", "text/html; charset=utf-8", "no-cache"),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8", "public, max-age=3600"),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8", "public, max-age=3600"),
@@ -115,6 +118,25 @@ def extract_verification_code(content: str) -> str:
     return ""
 
 
+_EMAIL_VALIDATION_ACTION = re.compile(
+    r"(?:输入|使用)\s*(?:以下|下列)\s*(?:验证代码|验证码|代码|口令)\s*"
+    r"(?:以)?\s*(?:完成|进行)?\s*(?:邮箱|身份|登录|安全)?\s*(?:验证|认证)\s*[:：]"
+)
+_EMAIL_CODE_LINE = re.compile(r"([A-Za-z0-9]{4,8})[。.!！]?")
+
+
+def extract_email_verification_code(subject: str, content: str) -> str:
+    """Accept a unique contextual code; do not scan arbitrary numbers in email."""
+    text = (subject + "\n" + content).replace("\r\n", "\n").replace("\r", "\n").replace("\u00a0", " ")
+    candidates = {match.group(1) for pattern in _CODE_PATTERNS for match in pattern.finditer(text)}
+    for marker in _EMAIL_VALIDATION_ACTION.finditer(text):
+        line = next((line.strip() for line in text[marker.end():].split("\n") if line.strip()), "")
+        match = _EMAIL_CODE_LINE.fullmatch(line)
+        if match:
+            candidates.add(match.group(1))
+    return next(iter(candidates)) if len(candidates) == 1 else ""
+
+
 def parse_sim_info(sim_info: str) -> tuple[str, str]:
     slot_match = _SIM_SLOT_PATTERN.search(sim_info or "")
     phone_match = _MOBILE_PATTERN.search(sim_info or "")
@@ -148,7 +170,10 @@ def enrich_message(row: dict[str, Any]) -> dict[str, Any]:
     text = str(message.get("content", ""))
     if message.get("message_type") == "email":
         text = str(message.get("subject", "")) + "\n" + text
-    message["verification_code"] = extract_verification_code(text)
+    message["verification_code"] = (
+        extract_email_verification_code(str(message.get("subject", "")), str(message.get("content", "")))
+        if message.get("message_type") == "email" else extract_verification_code(text)
+    )
     message["tag"] = extract_message_tag(text)
     message["sim_slot"] = sim_slot
     message["sim_phone"] = sim_phone
@@ -494,6 +519,50 @@ class FeishuClient:
             )
         return response
 
+def build_verification_card(message: dict[str, Any], public_base_url: str = "https://api.midi.lizhijian.xyz/sms-relay/") -> dict[str, Any]:
+    """Card 2.0: trusted code block and plain-text (not executable Markdown) metadata."""
+    code = str(message.get("verification_code", ""))
+    if not re.fullmatch(r"[A-Za-z0-9]{4,32}", code):
+        raise ValueError("invalid_verification_code")
+    is_email = message.get("message_type") == "email"
+    receiver = (message.get("recipient") if is_email else
+                message.get("sim_phone") or message.get("sim_slot")) or "未知"
+
+    def plain(value: str) -> dict[str, Any]:
+        return {"tag": "div", "text": {"tag": "plain_text", "content": value}}
+
+    elements = [
+        plain(f"{'接收邮箱' if is_email else '接收号码'}：{receiver}"),
+        {"tag": "markdown", "content": f"```\n{code}\n```"},
+    ]
+    tag = str(message.get("tag") or "").strip()[:128]
+    if tag:
+        elements.append(plain(f"平台：{tag}"))
+    elements.append(plain(f"来源：{str(message.get('sender') or '未知')[:512]}"))
+    if is_email:
+        elements.append(plain(f"邮件主题：{str(message.get('subject') or '无主题')[:2048]}"))
+    received_at = str(message.get("source_received_at") or message.get("received_at") or "未知")
+    try:
+        parsed_time = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+        if parsed_time.tzinfo is not None:
+            from datetime import timedelta
+            received_at = parsed_time.astimezone(timezone(timedelta(hours=8))).strftime("%Y-%m-%d %H:%M:%S UTC+08:00")
+    except ValueError:
+        pass
+    elements.append(plain(f"接收时间：{received_at}"))
+    parsed_base = urlsplit(public_base_url)
+    if parsed_base.scheme != "https" or not parsed_base.netloc or parsed_base.query or parsed_base.fragment or parsed_base.username:
+        raise ValueError("card_copy_url_must_be_https")
+    copy_url = public_base_url.rstrip("/") + "/copy?message_id=" + str(int(message["id"]))
+    elements.append({"tag": "button", "text": {"tag": "plain_text", "content": "复制验证码"},
+                     "type": "primary", "behaviors": [{"type": "open_url", "default_url": copy_url}]})
+    return {
+        "schema": "2.0",
+        "header": {"template": "blue", "title": {"tag": "plain_text", "content": "邮箱验证码" if is_email else "短信验证码"}},
+        "body": {"elements": elements},
+    }
+
+
 class FeishuNotifier:
     def __init__(
         self,
@@ -502,38 +571,24 @@ class FeishuNotifier:
         chat_id: str,
         *,
         client: FeishuClient | None = None,
+        public_base_url: str = "https://api.midi.lizhijian.xyz/sms-relay/",
     ):
         self.client = client or FeishuClient(app_id, app_secret)
         self.chat_id = chat_id
+        self.public_base_url = public_base_url
 
     def send(self, message: dict[str, Any]) -> None:
         code = str(message.get("verification_code", ""))
         if not code:
             return
-        is_email = message.get("message_type") == "email"
-        receiver = str(message.get("recipient") if is_email else
-                       message.get("sim_phone") or message.get("sim_slot") or "未知")
-        received_at = str(message.get("source_received_at") or message.get("received_at") or "未知")
-        tag = str(message.get("tag") or "").strip()[:128]
-        lines = [f"验证码：{code}"]
-        if tag:
-            lines.append(f"平台：{tag}")
-        lines.extend(
-            (
-                f"来源：{message.get('sender') or '未知'}",
-                f"{'接收邮箱' if is_email else '接收号码'}：{receiver}",
-                f"接收时间：{received_at}",
-            )
-        )
-        text = "\n".join(lines)
-        response = self.client.request(
+        self.client.request(
             "/open-apis/im/v1/messages",
             method="POST",
             params={"receive_id_type": "chat_id"},
             payload={
                 "receive_id": self.chat_id,
-                "msg_type": "text",
-                "content": json.dumps({"text": text}, ensure_ascii=False, separators=(",", ":")),
+                "msg_type": "interactive",
+                "content": json.dumps(build_verification_card(message, self.public_base_url), ensure_ascii=False, separators=(",", ":")),
                 "uuid": f"sms-relay-{message['id']}",
             },
         )
@@ -616,6 +671,7 @@ class RelayServer(ThreadingHTTPServer):
                 feishu_app_secret,
                 feishu_chat_id,
                 client=self.feishu_client,
+                public_base_url=self.auth_success_uri,
             )
         self.notification_lock = threading.Lock()
         self.notification_stop = threading.Event()
@@ -1356,6 +1412,17 @@ class RelayHandler(BaseHTTPRequestHandler):
                 HTTPStatus.OK,
                 {"ok": True, "recognized": bool(tag), "tag": tag},
             )
+            return
+        code_path = re.fullmatch(r"/v1/messages/([1-9][0-9]{0,17})/code", parsed.path)
+        if code_path:
+            if not self.require_read_auth():
+                return
+            message = self.server._load_message(int(code_path[1]))
+            if message is None:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+                return
+            fields = ("id", "message_type", "verification_code", "recipient", "sim_phone", "sim_slot", "sender", "subject")
+            self.send_json(HTTPStatus.OK, {"ok": True, "message": {field: message.get(field, "") for field in fields}})
             return
         if parsed.path == "/v1/mailboxes":
             if not self.require_read_auth():
