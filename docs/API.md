@@ -2,6 +2,8 @@
 
 ## 服务地址
 
+现已支持多个邮箱接码，配置与邮件投递见 [邮箱接入](EMAIL.md)。未配置邮箱时行为与原短信服务相同。
+
 ```text
 https://api.midi.lizhijian.xyz/sms-relay
 ```
@@ -55,6 +57,8 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?after_id=0&limit=50' 
 | --- | --- | --- | --- |
 | `after_id` | integer | 否 | 返回 `id` 大于该值的短信；首次增量读取使用 `0` |
 | `limit` | integer | 否 | 每页数量，范围 `1-200`，默认 `50` |
+| `message_type` | string | 否 | `sms` 或 `email`；不传返回所有消息 |
+| `recipient` | string | 否 | 按完整接收邮箱精确筛选，URL 编码；可与类型、历史或增量游标组合 |
 
 增量响应按 `id` 升序排列：
 
@@ -121,10 +125,13 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 | `id` | 单调递增的短信 ID，可作为增量游标 |
 | `received_at` | 服务端接收时间 |
 | `message_type` | 消息类型，短信通常为 `sms` |
+| `recipient` | 邮件的接收邮箱；短信为空 |
+| `subject` | 邮件主题；短信为空，邮件主题也参与验证码和标签识别 |
+| `source_message_id` | 邮件来源唯一标识；短信为空 |
 | `sender` | 短信发送方号码或签名 |
 | `content` | 短信正文 |
 | `tag` | 短信正文中第一个非空 `【…】` 的内容；没有签名时为空字符串 |
-| `source_received_at` | Android 设备上报的接收时间 |
+| `source_received_at` | Android 上报的接收时间；内置邮件接入为邮件 Date 头，缺失或无效时为空 |
 | `sim_info` | Android 端原始 SIM 信息 |
 | `device_name` | 上报设备名称 |
 | `app_version` | 上报应用版本 |
@@ -153,6 +160,8 @@ curl 'https://api.midi.lizhijian.xyz/sms-relay/v1/messages?before_id=100&limit=2
 ```
 
 ### 写入幂等语义
+
+以下 60 秒时间漂移规则只用于原短信等非邮件消息。`email` 要求 `recipient` 和 `source_message_id`，两者共同确定投递身份；不同邮箱或不同邮件标识独立保存，同一标识重试不会再次通知飞书。接口字段和完整语义见 [邮箱接入](EMAIL.md)。
 
 同一短信由原 SmsForwarder 与可靠投递 Outbox 重复提交时，只保留一条记录。服务端按以下字段判断投递身份：
 

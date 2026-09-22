@@ -11,6 +11,7 @@ android-outbox/signing/
 .coverage
 htmlcov/
 data/
+mailboxes.json
 *.db
 *.db-shm
 *.db-wal

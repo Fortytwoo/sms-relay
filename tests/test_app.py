@@ -253,6 +253,45 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(body["error"], "unauthorized")
 
+    def test_email_ingestion_validation_filters_and_incremental_cursor(self) -> None:
+        payload = {"type": "email", "from": "sender@example.test", "recipient": "a@example.test",
+                   "subject": "【测试】Your OTP is a7C91d", "content": "邮件正文",
+                   "source_message_id": "message-1"}
+        for changes in ({"recipient": ""}, {"source_message_id": ""}):
+            status, _ = self.request("POST", "/v1/messages", {**payload, **changes}, WRITE_API_KEY)
+            self.assertEqual(status, 400)
+        _, first = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        _, duplicate = self.request("POST", "/v1/messages", payload, WRITE_API_KEY)
+        self.assertTrue(duplicate["duplicate"])
+        self.assertEqual(first["id"], duplicate["id"])
+        self.request("POST", "/v1/messages", {**payload, "recipient": "b@example.test"}, WRITE_API_KEY)
+        self.request("POST", "/v1/messages", {"content": "短信"}, WRITE_API_KEY)
+        status, page = self.request("GET", "/v1/messages?message_type=email&after_id=0&limit=1", api_key=READ_API_KEY)
+        self.assertEqual(status, 200)
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["messages"][0]["verification_code"], "a7C91d")
+        self.assertEqual(page["messages"][0]["tag"], "测试")
+        status, page2 = self.request("GET", f"/v1/messages?message_type=email&after_id={page['next_after_id']}&limit=1", api_key=READ_API_KEY)
+        self.assertEqual(page2["messages"][0]["recipient"], "b@example.test")
+        self.assertFalse(page2["has_more"])
+        _, filtered = self.request("GET", "/v1/messages?recipient=a%40example.test", api_key=READ_API_KEY)
+        self.assertEqual(filtered["count"], 1)
+        _, sms = self.request("GET", "/v1/messages?message_type=sms", api_key=READ_API_KEY)
+        self.assertEqual(sms["count"], 1)
+        self.assertEqual(self.request("GET", "/v1/messages?message_type=bogus", api_key=READ_API_KEY)[0], 400)
+
+    def test_mailbox_status_uses_read_auth_without_credentials(self) -> None:
+        from mail_receiver import MailAccount, MailReceiver
+        account = MailAccount("a", "a@example.test", "imap.example.test", "test-login", "synthetic-secret")
+        self.server.mail_receiver = MailReceiver(self.db_path, [account], self.server.ingest_message)
+        for key in (None, WRITE_API_KEY):
+            self.assertEqual(self.request("GET", "/v1/mailboxes", api_key=key)[0], 401)
+        status, payload = self.request("GET", "/v1/mailboxes", api_key=READ_API_KEY)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["mailboxes"][0]["address"], account.address)
+        self.assertNotIn("synthetic-secret", json.dumps(payload))
+        self.assertNotIn("test-login", json.dumps(payload))
+
     def test_insert_deduplicates_and_lists_utf8_message(self) -> None:
         payload = {
             "type": "sms",

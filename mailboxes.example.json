@@ -1,0 +1,14 @@
+[
+  {
+    "id": "work-a",
+    "address": "account-a@example.com",
+    "host": "imap.exmail.qq.com",
+    "password": "replace-with-mailbox-or-client-password"
+  },
+  {
+    "id": "work-b",
+    "address": "account-b@example.com",
+    "host": "imap.exmail.qq.com",
+    "password": "replace-with-mailbox-or-client-password"
+  }
+]

@@ -1,0 +1,12 @@
+.git/
+.venv/
+**/__pycache__/
+data/
+backups/
+.env
+.env.*
+mailboxes.json
+*.db
+*.db-*
+android-outbox/signing/
+android-outbox/build/

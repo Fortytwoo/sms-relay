@@ -393,3 +393,9 @@ svg {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
 }
+/* Shared inbox filters for SMS and multiple mailboxes. */
+.message-filters { display: flex; gap: 12px; margin: 12px 0; }
+.message-filters label { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 6px; font-size: 12px; }
+.message-filters select { width: 100%; min-width: 0; padding: 8px; border: 1px solid #d9e0e8; border-radius: 6px; background: white; color: inherit; }
+.mailbox-status { margin: 0 0 12px; font-size: 12px; color: #667085; }
+#detail-phone, #detail-subject { overflow-wrap: anywhere; }

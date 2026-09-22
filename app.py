@@ -145,8 +145,11 @@ def identify_platform(url: str) -> str:
 def enrich_message(row: dict[str, Any]) -> dict[str, Any]:
     message = dict(row)
     sim_slot, sim_phone = parse_sim_info(str(message.get("sim_info", "")))
-    message["verification_code"] = extract_verification_code(str(message.get("content", "")))
-    message["tag"] = extract_message_tag(str(message.get("content", "")))
+    text = str(message.get("content", ""))
+    if message.get("message_type") == "email":
+        text = str(message.get("subject", "")) + "\n" + text
+    message["verification_code"] = extract_verification_code(text)
+    message["tag"] = extract_message_tag(text)
     message["sim_slot"] = sim_slot
     message["sim_phone"] = sim_phone
     return message
@@ -230,6 +233,9 @@ def init_db(db_path: str) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(messages)").fetchall()
         }
         migrations = {
+            "recipient": "TEXT NOT NULL DEFAULT ''",
+            "subject": "TEXT NOT NULL DEFAULT ''",
+            "source_message_id": "TEXT NOT NULL DEFAULT ''",
             "lark_push_status": "TEXT NOT NULL DEFAULT 'skipped'",
             "lark_push_attempts": "INTEGER NOT NULL DEFAULT 0",
             "lark_pushed_at": "TEXT NOT NULL DEFAULT ''",
@@ -247,6 +253,10 @@ def init_db(db_path: str) -> None:
             ON messages(message_type, sender, source_received_at)
             """
         )
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_email_identity "
+            "ON messages(message_type, recipient, source_message_id)"
+        )
 
 
 def parse_message(payload: Any) -> dict[str, str]:
@@ -261,6 +271,9 @@ def parse_message(payload: Any) -> dict[str, str]:
         "sim_info": ("sim_info", "card_slot"),
         "device_name": ("device_name", "device"),
         "app_version": ("app_version",),
+        "recipient": ("recipient", "to"),
+        "subject": ("subject",),
+        "source_message_id": ("source_message_id",),
     }
 
     result: dict[str, str] = {}
@@ -276,7 +289,7 @@ def parse_message(payload: Any) -> dict[str, str]:
             raise ValueError(f"{target} must be a scalar value")
         result[target] = str(value).strip()
 
-    if not result["content"]:
+    if not result["content"] and not (result["message_type"] == "email" and result["subject"]):
         raise ValueError("content is required")
     if len(result["content"]) > MAX_CONTENT_CHARS:
         raise ValueError("content is too long")
@@ -288,6 +301,9 @@ def parse_message(payload: Any) -> dict[str, str]:
         "sim_info": 1024,
         "device_name": 256,
         "app_version": 64,
+        "recipient": 320,
+        "subject": 2048,
+        "source_message_id": 1024,
     }
     for field, limit in limits.items():
         if len(result[field]) > limit:
@@ -295,10 +311,22 @@ def parse_message(payload: Any) -> dict[str, str]:
 
     if not result["message_type"]:
         result["message_type"] = "sms"
+    if result["message_type"] == "email":
+        from mail_receiver import normalize_address
+
+        result["recipient"] = normalize_address(result["recipient"])
+        if not result["source_message_id"]:
+            raise ValueError("source_message_id is required for email")
+    else:
+        # Email identity must never affect the existing SMS deduplication contract.
+        result.update(recipient="", subject="", source_message_id="")
     return result
 
 
 def fingerprint(message: dict[str, str]) -> str:
+    if message["message_type"] == "email":
+        identity = ["email", message["recipient"], message["source_message_id"]]
+        return hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
     canonical = json.dumps(
         {
             "message_type": message["message_type"],
@@ -346,6 +374,12 @@ def _find_existing_message(
     connection: sqlite3.Connection,
     message: dict[str, str],
 ) -> sqlite3.Row | None:
+    if message["message_type"] == "email":
+        return connection.execute(
+            "SELECT id, message_key, lark_push_status FROM messages "
+            "WHERE message_type = 'email' AND recipient = ? AND source_message_id = ?",
+            (message["recipient"], message["source_message_id"]),
+        ).fetchone()
     candidates = connection.execute(
         """
         SELECT id, source_received_at, message_key, lark_push_status
@@ -476,7 +510,9 @@ class FeishuNotifier:
         code = str(message.get("verification_code", ""))
         if not code:
             return
-        receiver = str(message.get("sim_phone") or message.get("sim_slot") or "未知")
+        is_email = message.get("message_type") == "email"
+        receiver = str(message.get("recipient") if is_email else
+                       message.get("sim_phone") or message.get("sim_slot") or "未知")
         received_at = str(message.get("source_received_at") or message.get("received_at") or "未知")
         tag = str(message.get("tag") or "").strip()[:128]
         lines = [f"验证码：{code}"]
@@ -485,7 +521,7 @@ class FeishuNotifier:
         lines.extend(
             (
                 f"来源：{message.get('sender') or '未知'}",
-                f"接收号码：{receiver}",
+                f"{'接收邮箱' if is_email else '接收号码'}：{receiver}",
                 f"接收时间：{received_at}",
             )
         )
@@ -585,6 +621,7 @@ class RelayServer(ThreadingHTTPServer):
         self.notification_stop = threading.Event()
         self.notification_event = threading.Event()
         self.notification_thread: threading.Thread | None = None
+        self.mail_receiver = None
         init_db(db_path)
         super().__init__(address, RelayHandler)
         if self.notifier is not None:
@@ -893,12 +930,47 @@ class RelayServer(ThreadingHTTPServer):
                 SELECT id, received_at, message_type, sender, content,
                        source_received_at, sim_info, device_name, app_version,
                        message_key, lark_push_status, lark_push_attempts,
-                       lark_pushed_at, lark_push_error
+                       lark_pushed_at, lark_push_error, recipient, subject, source_message_id
                 FROM messages WHERE id = ?
                 """,
                 (row_id,),
             ).fetchone()
         return enrich_message(dict(row)) if row else None
+
+    def ingest_message(self, payload: Any, source_ip: str = "") -> dict[str, Any]:
+        """Shared transactional ingestion for HTTP senders and mailbox polling."""
+        message = parse_message(payload)
+        enriched = enrich_message(message)
+        message_key = fingerprint(message)
+        has_code = bool(enriched["verification_code"])
+        initial_status = "pending" if has_code and self.notifier else "disabled" if has_code else "skipped"
+        with open_db(self.db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            stored = _find_existing_message(connection, message)
+            if stored is None:
+                fields = ["message_type", "sender", "content", "source_received_at",
+                          "sim_info", "device_name", "app_version", "recipient",
+                          "subject", "source_message_id"]
+                cursor = connection.execute(
+                    "INSERT INTO messages (received_at, " + ", ".join(fields) +
+                    ", message_key, source_ip, lark_push_status) VALUES (" +
+                    ", ".join("?" for _ in range(len(fields) + 4)) + ")",
+                    [utc_now(), *(message[field] for field in fields),
+                     message_key, source_ip, initial_status],
+                )
+                row_id, push_status, duplicate = int(cursor.lastrowid), initial_status, False
+            else:
+                row_id, push_status, duplicate = int(stored["id"]), str(stored["lark_push_status"]), True
+                message_key = str(stored["message_key"])
+        if not duplicate and push_status == "pending":
+            if self.notification_thread is not None:
+                self.notification_event.set()
+            else:
+                push_status = self.deliver_notification(row_id)
+        return {"ok": True, "id": row_id, "duplicate": duplicate,
+                "message_key": message_key, "tag": enriched["tag"],
+                "sim_slot": enriched["sim_slot"], "sim_phone": enriched["sim_phone"],
+                "recipient": message["recipient"], "lark_push_status": push_status}
 
     def deliver_notification(self, row_id: int) -> str:
         if self.notifier is None:
@@ -965,6 +1037,8 @@ class RelayServer(ThreadingHTTPServer):
                     self.notification_stop.wait(5)
 
     def server_close(self) -> None:
+        if self.mail_receiver is not None:
+            self.mail_receiver.close()
         self.notification_stop.set()
         self.notification_event.set()
         if self.notification_thread and self.notification_thread is not threading.current_thread():
@@ -1283,6 +1357,12 @@ class RelayHandler(BaseHTTPRequestHandler):
                 {"ok": True, "recognized": bool(tag), "tag": tag},
             )
             return
+        if parsed.path == "/v1/mailboxes":
+            if not self.require_read_auth():
+                return
+            accounts = self.server.mail_receiver.status() if self.server.mail_receiver else []
+            self.send_json(HTTPStatus.OK, {"ok": True, "mailboxes": accounts})
+            return
         if parsed.path != "/v1/messages":
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
@@ -1305,19 +1385,30 @@ class RelayHandler(BaseHTTPRequestHandler):
         sql = """
             SELECT id, received_at, message_type, sender, content,
                    source_received_at, sim_info, device_name, app_version, message_key,
-                   lark_push_status, lark_push_attempts, lark_pushed_at
+                   lark_push_status, lark_push_attempts, lark_pushed_at,
+                   recipient, subject, source_message_id
             FROM messages
         """
         parameters: list[Any] = []
+        conditions: list[str] = []
+        for field in ("message_type", "recipient"):
+            value = query.get(field, [""])[0]
+            if value:
+                if field == "message_type" and value not in {"sms", "email"}:
+                    self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_query"})
+                    return
+                conditions.append(f"{field} = ?")
+                parameters.append(value)
         if incremental:
-            sql += " WHERE id > ? ORDER BY id ASC LIMIT ?"
-            parameters.extend((after_id, limit + 1))
+            conditions.append("id > ?")
+            parameters.append(after_id)
         elif before_id > 0:
-            sql += " WHERE id < ?"
+            conditions.append("id < ?")
             parameters.append(before_id)
-        if not incremental:
-            sql += " ORDER BY id DESC LIMIT ?"
-            parameters.append(limit)
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY id " + ("ASC" if incremental else "DESC") + " LIMIT ?"
+        parameters.append(limit + 1 if incremental else limit)
 
         with open_db(self.server.db_path) as connection:
             rows = [enrich_message(dict(row)) for row in connection.execute(sql, parameters)]
@@ -1386,83 +1477,18 @@ class RelayHandler(BaseHTTPRequestHandler):
             self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
             return
 
-        message_key = fingerprint(message)
-        source_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(",", 1)[0].strip()[:64]
-        server_received_at = utc_now()
-        has_code = bool(extract_verification_code(message["content"]))
-        tag = extract_message_tag(message["content"])
-        sim_slot, sim_phone = parse_sim_info(message["sim_info"])
-        initial_push_status = "pending" if has_code and self.server.notifier else "disabled" if has_code else "skipped"
-
-        response_message_key = message_key
-        with open_db(self.server.db_path) as connection:
-            # The read and insert must be one write transaction so simultaneous
-            # deliveries with slightly different device timestamps cannot both win.
-            connection.execute("BEGIN IMMEDIATE")
-            stored = _find_existing_message(connection, message)
-            if stored is not None:
-                duplicate = True
-                row_id = int(stored["id"])
-                push_status = str(stored["lark_push_status"])
-                response_message_key = str(stored["message_key"])
-            else:
-                cursor = connection.execute(
-                    """
-                    INSERT OR IGNORE INTO messages (
-                        received_at, message_type, sender, content, source_received_at,
-                        sim_info, device_name, app_version, message_key, source_ip,
-                        lark_push_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        server_received_at,
-                        message["message_type"],
-                        message["sender"],
-                        message["content"],
-                        message["source_received_at"],
-                        message["sim_info"],
-                        message["device_name"],
-                        message["app_version"],
-                        message_key,
-                        source_ip,
-                        initial_push_status,
-                    ),
-                )
-                duplicate = cursor.rowcount == 0
-            if stored is None and duplicate:
-                stored = connection.execute(
-                    "SELECT id, lark_push_status FROM messages WHERE message_key = ?",
-                    (message_key,),
-                ).fetchone()
-                row_id, push_status = int(stored[0]), str(stored[1])
-            elif stored is None:
-                row_id, push_status = int(cursor.lastrowid), initial_push_status
-
-        if push_status in {"pending", "failed"} and self.server.notifier is not None:
-            if self.server.notification_thread is not None:
-                self.server.notification_event.set()
-            else:
-                push_status = self.server.deliver_notification(row_id)
-
-        self.send_json(
-            HTTPStatus.OK,
-            {
-                "ok": True,
-                "id": row_id,
-                "duplicate": duplicate,
-                "message_key": response_message_key,
-                "tag": tag,
-                "sim_slot": sim_slot,
-                "sim_phone": sim_phone,
-                "lark_push_status": push_status,
-            },
-        )
+        source_ip = self.headers.get("X-Forwarded-For", self.client_address[0]).split(
+            ",", 1)[0].strip()[:64]
+        self.send_json(HTTPStatus.OK, self.server.ingest_message(message, source_ip))
 
     def do_PUT(self) -> None:  # noqa: N802
         self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
 
 
 def main() -> None:
+    from mail_receiver import MailReceiver, load_accounts
+
+    accounts = load_accounts(os.environ.get("SMS_RELAY_MAILBOXES_FILE", ""))
     api_key = os.environ.get("SMS_RELAY_API_KEY", "")
     read_api_key = os.environ.get("SMS_RELAY_READ_API_KEY", "")
     db_path = os.environ.get("SMS_RELAY_DB_PATH", "/data/sms-relay.db")
@@ -1519,6 +1545,7 @@ def main() -> None:
         json.dumps(
             {
                 "event": "started",
+                "mailboxes": len(accounts),
                 "host": host,
                 "port": port,
                 "db_path": db_path,
@@ -1531,6 +1558,9 @@ def main() -> None:
         flush=True,
     )
     try:
+        if accounts:
+            server.mail_receiver = MailReceiver(server.db_path, accounts, server.ingest_message)
+            server.mail_receiver.start()
         server.serve_forever()
     except KeyboardInterrupt:
         pass

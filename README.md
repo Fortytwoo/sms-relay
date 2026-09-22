@@ -7,6 +7,7 @@
 
 ## 功能
 
+- 多个腾讯企业邮箱接码：IMAP/TLS 接收、独立游标和邮箱隔离去重，与短信共用提取、查询及通知，见 [邮箱接入配置](docs/EMAIL.md)。
 - 独立的 64 位写入与只读 API Key，支持 `X-API-Key` 和 Bearer Header。
 - SQLite 持久化；同一发送方、正文和消息类型在 60 秒设备接收时间漂移内按同一短信去重。
 - 自动识别 4–8 位数字或字母数字验证码，以及 4–32 位字母数字文件提取码或解压密码；所有值均保留短信中的原始大小写。
@@ -173,9 +174,10 @@ SMS_RELAY_API_KEY='<64-character-secret>' uv run python configure_smsforwarder.p
 | 方法与路径 | 鉴权 | 说明 |
 | --- | --- | --- |
 | `GET /health` | 无 | 只返回存活状态，不返回短信数量 |
-| `POST /v1/messages` | 写入 API Key | 接收一条短信 |
-| `GET /v1/messages?limit=50&before_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 倒序分页读取历史短信 |
-| `GET /v1/messages?limit=50&after_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 正序获取游标之后的新短信 |
+| `GET /v1/mailboxes` | 中央 OAuth 应用会话或只读 API Key | 查看邮箱同步状态，不返回凭据 |
+| `POST /v1/messages` | 写入 API Key | 接收一条短信或邮件 |
+| `GET /v1/messages?limit=50&before_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 倒序分页读取历史消息；支持类型和邮箱筛选 |
+| `GET /v1/messages?limit=50&after_id=123` | 中央 OAuth 应用会话或只读 API Key | 按 ID 正序获取游标之后的新消息；支持类型和邮箱筛选 |
 | `GET /v1/platforms/identify?url=...` | 中央 OAuth 应用会话或只读 API Key | 根据页面 URL 返回标准平台 `tag` |
 | `GET /auth/login` | 无 | 生成 state/PKCE 并跳转中央认证 |
 | `GET /auth/callback` | OAuth state + issuer + transaction Cookie | 兑换中央 token 并创建 BFF Session |
@@ -268,6 +270,7 @@ node --check web/app.js
 
 ```text
 app.py                       HTTP API、BFF Session、SQLite 与飞书通知
+mail_receiver.py             多邮箱 IMAP/TLS 接收、MIME 解析与持久游标
 central_auth.py              中央 OAuth metadata、PKCE、token、introspection 与 revoke
 web/                         无构建步骤的网页收件箱
 tests/                       标准库 unittest 测试

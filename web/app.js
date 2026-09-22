@@ -23,6 +23,12 @@ const elements = {
   loginError: document.querySelector("#login-error"),
   logoutButton: document.querySelector("#logout-button"),
   searchInput: document.querySelector("#search-input"),
+  messageType: document.querySelector("#message-type"),
+  recipientFilter: document.querySelector("#recipient-filter"),
+  mailboxStatus: document.querySelector("#mailbox-status"),
+  subjectRow: document.querySelector("#detail-subject-row"),
+  detailSubject: document.querySelector("#detail-subject"),
+  receiverLabel: document.querySelector("#receiver-label"),
   refreshButton: document.querySelector("#refresh-button"),
   autoRefresh: document.querySelector("#auto-refresh"),
   messageList: document.querySelector("#message-list"),
@@ -57,6 +63,8 @@ function apiUrl(beforeId) {
   const url = relativeUrl("v1/messages");
   url.searchParams.set("limit", String(PAGE_SIZE));
   if (beforeId) url.searchParams.set("before_id", String(beforeId));
+  if (elements.messageType.value) url.searchParams.set("message_type", elements.messageType.value);
+  if (elements.recipientFilter.value) url.searchParams.set("recipient", elements.recipientFilter.value);
   return url;
 }
 
@@ -107,9 +115,15 @@ function showToast(message) {
 
 function showLogin(message = "") {
   stopAutoRefresh();
+  state.requestController?.abort();
   state.user = null;
   state.messages = [];
   state.selectedId = null;
+  elements.messageList.replaceChildren();
+  elements.detailContent.textContent = "";
+  elements.detailSubject.textContent = "";
+  elements.recipientFilter.replaceChildren(new Option("全部邮箱", ""));
+  elements.mailboxStatus.hidden = true;
   document.body.classList.remove("detail-open");
   document.body.classList.add("is-auth-view");
   elements.inboxView.hidden = true;
@@ -167,6 +181,7 @@ function messageTime(message) {
 }
 
 function simLabel(message) {
+  if (message.message_type === "email") return message.recipient || "未提供";
   if (message.sim_slot && message.sim_phone) return `${message.sim_slot} · ${message.sim_phone}`;
   return message.sim_phone || message.sim_slot || message.sim_info || "未提供";
 }
@@ -175,7 +190,7 @@ function filteredMessages() {
   const query = elements.searchInput.value.trim().toLocaleLowerCase("zh-CN");
   if (!query) return state.messages;
   return state.messages.filter((message) =>
-    `${message.sender} ${message.tag || ""} ${message.content} ${message.verification_code || ""} ${simLabel(message)}`
+    `${message.sender} ${message.tag || ""} ${message.subject || ""} ${message.content} ${message.verification_code || ""} ${simLabel(message)}`
       .toLocaleLowerCase("zh-CN").includes(query));
 }
 
@@ -209,7 +224,7 @@ function buildMessageItem(message) {
   identity.className = "message-identity";
   const sender = document.createElement("span");
   sender.className = "message-sender";
-  sender.textContent = message.sender || "未知号码";
+  sender.textContent = message.sender || "未知发送方";
   identity.append(sender);
   if (message.tag) {
     const tag = document.createElement("span");
@@ -226,7 +241,14 @@ function buildMessageItem(message) {
   preview.textContent = message.verification_code
     ? `验证码 ${message.verification_code} · ${message.content}`
     : message.content;
-  main.append(head, preview);
+  main.append(head);
+  if (message.message_type === "email") {
+    const recipient = document.createElement("span");
+    recipient.className = "message-preview";
+    recipient.textContent = `邮件 · ${message.recipient} · ${message.subject || "无主题"}`;
+    main.append(recipient);
+  }
+  main.append(preview);
 
   const chevron = document.createElement("span");
   chevron.className = "message-chevron";
@@ -242,8 +264,8 @@ function renderList() {
   elements.messageList.hidden = messages.length === 0;
   elements.listEmpty.hidden = messages.length !== 0;
   const queryActive = Boolean(elements.searchInput.value.trim());
-  elements.listEmpty.querySelector("strong").textContent = queryActive ? "没有匹配结果" : "暂无短信";
-  elements.listEmpty.querySelector("span").textContent = queryActive ? "请尝试其他号码或关键词" : "收到新短信后会自动出现在这里";
+  elements.listEmpty.querySelector("strong").textContent = queryActive ? "没有匹配结果" : "暂无消息";
+  elements.listEmpty.querySelector("span").textContent = queryActive ? "请尝试其他邮箱、号码或关键词" : "收到新短信或邮件后会自动出现在这里";
   elements.listFooter.textContent = queryActive ? `找到 ${messages.length} 条` : `共 ${state.messages.length} 条`;
   elements.loadMore.hidden = !state.hasMore || queryActive;
 }
@@ -255,12 +277,19 @@ function renderDetail() {
   if (!selected) return;
   elements.detailTagRow.hidden = !selected.tag;
   elements.detailTag.textContent = selected.tag || "";
-  elements.detailSender.textContent = selected.sender || "未知号码";
+  elements.detailSender.textContent = selected.sender || "未知发送方";
+  const isEmail = selected.message_type === "email";
+  elements.subjectRow.hidden = !isEmail;
+  elements.detailSubject.textContent = selected.subject || "无主题";
+  elements.receiverLabel.textContent = isEmail ? "接收邮箱" : "接收手机号";
+  for (const element of [elements.detailSim, elements.detailDevice, elements.detailVersion]) {
+    element.closest(".detail-row").hidden = isEmail;
+  }
   elements.detailContent.textContent = selected.content;
   elements.verificationRow.hidden = !selected.verification_code;
   elements.detailCode.textContent = selected.verification_code || "";
   elements.detailTime.textContent = fullDate(messageTime(selected));
-  elements.detailPhone.textContent = selected.sim_phone || "未提供";
+  elements.detailPhone.textContent = (isEmail ? selected.recipient : selected.sim_phone) || "未提供";
   elements.detailSim.textContent = selected.sim_slot
     || (selected.sim_phone ? "未提供" : selected.sim_info)
     || "未提供";
@@ -296,15 +325,19 @@ async function copyText(value, successMessage) {
 }
 
 async function fetchMessages({ append = false, quiet = false } = {}) {
-  if (state.loading) return false;
+  if (state.loading && (append || quiet)) return false;
+  state.requestController?.abort();
+  const controller = new AbortController();
+  state.requestController = controller;
   state.loading = true;
   if (!quiet) elements.refreshButton.classList.add("is-loading");
   const beforeId = append && state.messages.length ? state.messages[state.messages.length - 1].id : null;
   try {
-    const response = await fetch(apiUrl(beforeId), { cache: "no-store" });
+    const response = await fetch(apiUrl(beforeId), { cache: "no-store", signal: controller.signal });
     if (response.status === 401) throw new Error("unauthorized");
     if (!response.ok) throw new Error(`http_${response.status}`);
     const payload = await response.json();
+    if (controller !== state.requestController || !state.user) return false;
     const incoming = Array.isArray(payload.messages) ? payload.messages : [];
     if (append) {
       const existing = new Set(state.messages.map((message) => message.id));
@@ -318,8 +351,10 @@ async function fetchMessages({ append = false, quiet = false } = {}) {
     state.hasMore = incoming.length === PAGE_SIZE;
     setServiceState(true);
     render();
+    if (!append) fetchMailboxStatus();
     return true;
   } catch (error) {
+    if (error.name === "AbortError" || controller !== state.requestController) return false;
     if (error.message === "unauthorized") {
       showLogin("登录已过期，请重新通过统一认证登录");
     } else {
@@ -328,8 +363,36 @@ async function fetchMessages({ append = false, quiet = false } = {}) {
     }
     return false;
   } finally {
-    state.loading = false;
-    elements.refreshButton.classList.remove("is-loading");
+    if (controller === state.requestController) {
+      state.loading = false;
+      elements.refreshButton.classList.remove("is-loading");
+    }
+  }
+}
+
+async function fetchMailboxStatus() {
+  try {
+    const response = await fetch(relativeUrl("v1/mailboxes"), { cache: "no-store" });
+    if (!response.ok) throw new Error("mailbox_status_failed");
+    const payload = await response.json();
+    if (!state.user) return;
+    const accounts = payload.mailboxes || [];
+    const selected = elements.recipientFilter.value;
+    const addresses = new Set(accounts.map((account) => account.address));
+    state.messages.filter((message) => message.recipient).forEach((message) => addresses.add(message.recipient));
+    if (selected) addresses.add(selected);
+    elements.recipientFilter.replaceChildren(new Option("全部邮箱", ""),
+      ...[...addresses].sort().map((address) => new Option(address, address)));
+    elements.recipientFilter.value = selected;
+    elements.mailboxStatus.hidden = !accounts.length;
+    const failed = accounts.filter((account) => account.last_error).length;
+    const pending = accounts.filter((account) => !account.last_success_at && !account.last_error).length;
+    const skipped = accounts.reduce((sum, account) => sum + account.skipped_count, 0);
+    elements.mailboxStatus.textContent = `${accounts.length} 个邮箱 · ${failed ? `${failed} 个同步异常` : pending ? `${pending} 个等待首次同步` : "同步正常"}${skipped ? ` · 已跳过 ${skipped} 封超大邮件` : ""}`;
+  } catch {
+    if (!state.user) return;
+    elements.mailboxStatus.hidden = false;
+    elements.mailboxStatus.textContent = "邮箱同步状态暂时不可用";
   }
 }
 
@@ -373,6 +436,21 @@ elements.logoutButton.addEventListener("click", async () => {
 elements.refreshButton.addEventListener("click", () => fetchMessages());
 elements.autoRefresh.addEventListener("change", startAutoRefresh);
 elements.searchInput.addEventListener("input", render);
+function reloadFilteredMessages() {
+  state.messages = [];
+  state.selectedId = null;
+  state.hasMore = false;
+  render();
+  fetchMessages();
+}
+elements.messageType.addEventListener("change", () => {
+  if (elements.messageType.value === "sms") elements.recipientFilter.value = "";
+  reloadFilteredMessages();
+});
+elements.recipientFilter.addEventListener("change", () => {
+  if (elements.recipientFilter.value) elements.messageType.value = "email";
+  reloadFilteredMessages();
+});
 elements.loadMore.addEventListener("click", () => fetchMessages({ append: true }));
 elements.backButton.addEventListener("click", () => {
   document.body.classList.remove("detail-open");
@@ -380,7 +458,7 @@ elements.backButton.addEventListener("click", () => {
   if (selected) selected.focus();
 });
 elements.copySender.addEventListener("click", () =>
-  copyText(elements.detailSender.textContent, "号码已复制"));
+  copyText(elements.detailSender.textContent, "发送方已复制"));
 elements.detailCode.addEventListener("click", () =>
   copyText(elements.detailCode.textContent, "验证码已复制"));
 
