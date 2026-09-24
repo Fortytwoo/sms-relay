@@ -1498,8 +1498,15 @@ class RelayHandler(BaseHTTPRequestHandler):
         if parsed.path == "/v1/mailboxes/config":
             if not self.require_mailbox_auth():
                 return
+            statuses = {item["id"]: item for item in
+                        (self.server.mail_receiver.status() if self.server.mail_receiver else [])}
+            accounts = self.server.mailbox_config.list_public()
+            for account in accounts:
+                status = statuses.get(account["id"], {})
+                for field in ("last_success_at", "last_error", "skipped_count", "next_retry_at"):
+                    account[field] = status.get(field, "" if field in ("last_success_at", "last_error") else 0)
             self.send_json(HTTPStatus.OK, {"ok": True,
-                           "mailboxes": self.server.mailbox_config.list_public()})
+                           "mailboxes": accounts})
             return
         if parsed.path != "/v1/messages":
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
@@ -1583,9 +1590,13 @@ class RelayHandler(BaseHTTPRequestHandler):
             if test_match[2] == "send" and not account.smtp_host:
                 self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "smtp_not_configured"})
                 return
-            from mail_receiver import test_receive, test_send
+            from mail_receiver import MailboxLoginError, test_receive, test_send
             try:
                 (test_send if test_match[2] == "send" else test_receive)(account)
+            except MailboxLoginError:
+                self.send_json(HTTPStatus.BAD_GATEWAY,
+                               {"ok": False, "error": "mailbox_auth_failed"})
+                return
             except Exception:
                 self.send_json(HTTPStatus.BAD_GATEWAY,
                                {"ok": False, "error": "smtp_test_failed" if test_match[2] == "send" else "imap_test_failed"})

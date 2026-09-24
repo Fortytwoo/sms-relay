@@ -85,6 +85,10 @@ def parse_accounts(records: object) -> list[MailAccount]:
                 raise ValueError
             values = dict(record)
             values["username"] = values.get("username") or values.get("address")
+            if (isinstance(values.get("host"), str)
+                    and values["host"].lower() == "imap.exmail.qq.com"
+                    and not values.get("smtp_host")):
+                values["smtp_host"] = "smtp.exmail.qq.com"
             account = MailAccount(**values)
             if any(not isinstance(getattr(account, name), str) or not getattr(account, name)
                    for name in ("id", "address", "host", "username", "password", "folder")):
@@ -122,9 +126,12 @@ def test_receive(account: MailAccount, *, client_factory=imaplib.IMAP4_SSL) -> N
     client = client_factory(account.host, account.port,
                             ssl_context=ssl.create_default_context(), timeout=15)
     try:
-        kind, _ = client.login(account.username, account.password)
-        if kind != "OK":
-            raise imaplib.IMAP4.error("login_failed")
+        try:
+            kind, _ = client.login(account.username, account.password)
+            if kind != "OK":
+                raise imaplib.IMAP4.error("login_failed")
+        except imaplib.IMAP4.error:
+            raise MailboxLoginError("mailbox_auth_failed") from None
         kind, data = client.select('"' + account.folder + '"', readonly=True)
         if kind != "OK":
             raise imaplib.IMAP4.error("select_failed")
@@ -373,9 +380,15 @@ class MailReceiver:
 
     def replace_accounts(self, accounts: list[MailAccount]):
         with self.accounts_lock, _db(self.db_path) as connection:
+            previous = {account.state_key: account for account in self.accounts}
             for account in accounts:
                 connection.execute("INSERT OR IGNORE INTO mailbox_state(state_key) VALUES (?)",
                                    (account.state_key,))
+                old = previous.get(account.state_key)
+                if old and old.password != account.password:
+                    connection.execute("""UPDATE mailbox_state
+                        SET last_error = '', next_retry_at = 0, consecutive_failures = 0
+                        WHERE state_key = ?""", (account.state_key,))
             self.accounts = list(accounts)
 
     def _loop(self):

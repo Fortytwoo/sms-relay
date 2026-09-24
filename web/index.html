@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#ffffff">
   <title>短信中转</title>
-  <link rel="stylesheet" href="assets/app.css?v=1.5.1">
+  <link rel="stylesheet" href="assets/app.css?v=1.5.2">
 </head>
 <body class="is-auth-view">
   <div class="site-shell">
@@ -228,7 +228,7 @@
               <label>邮箱密码 / 客户端密码<input name="password" type="password" autocomplete="new-password" placeholder="编辑时留空表示不更换"></label>
               <label>收件文件夹<input name="folder" required value="INBOX"></label>
               <label>首次同步<select name="start_from"><option value="latest">仅接收新增邮件</option><option value="all">读取历史邮件并可能通知</option></select></label>
-              <label>SMTP 主机<input name="smtp_host" placeholder="填写邮箱服务商提供的 SMTP 地址" autocomplete="off"></label>
+              <label>SMTP 主机<input name="smtp_host" placeholder="腾讯企业邮自动使用 smtp.exmail.qq.com" autocomplete="off"></label>
               <label>SMTP 端口<input name="smtp_port" type="number" min="1" max="65535" required value="465"></label>
               <label>SMTP 安全连接<select name="smtp_security"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
               <label>SMTP 用户名<input name="smtp_username" placeholder="默认使用 IMAP 用户名" autocomplete="off"></label>
@@ -244,6 +244,6 @@
 
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-  <script src="assets/app.js?v=1.5.0" defer></script>
+  <script src="assets/app.js?v=1.5.2" defer></script>
 </body>
 </html>

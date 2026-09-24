@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import FeishuNotifier, RelayServer, enrich_message, fingerprint, init_db, open_db, parse_message
-from mail_receiver import MAX_MAIL_BYTES, MailAccount, MailReceiver, load_accounts, parse_email, test_receive, test_send
+from mail_receiver import MAX_MAIL_BYTES, MailAccount, MailReceiver, MailboxLoginError, load_accounts, parse_accounts, parse_email, test_receive, test_send
 from test_app import FakeCentralAuth
 
 
@@ -77,6 +77,24 @@ class FakeIMAP:
 
 
 class MailConnectionTests(unittest.TestCase):
+    def test_exmail_defaults_to_its_tls_smtp_server_only_for_known_imap_host(self):
+        base = {"id": "a", "address": "a@example.test", "host": "imap.exmail.qq.com", "password": "secret"}
+        self.assertEqual(parse_accounts([base])[0].smtp_host, "smtp.exmail.qq.com")
+        self.assertEqual(parse_accounts([{**base, "smtp_host": ""}])[0].smtp_host, "smtp.exmail.qq.com")
+        self.assertEqual(parse_accounts([{**base, "host": "imap.other.test"}])[0].smtp_host, "")
+        self.assertEqual(parse_accounts([{**base, "smtp_host": "custom.smtp.test"}])[0].smtp_host, "custom.smtp.test")
+
+    def test_receive_redacts_provider_login_rejection(self):
+        class Client:
+            def login(self, username, password):
+                raise imaplib.IMAP4.error("provider echoed secret")
+            def logout(self):
+                pass
+        account = MailAccount("a", "a@example.test", "imap.example.test", "a@example.test", "secret")
+        with self.assertRaises(MailboxLoginError) as failure:
+            test_receive(account, client_factory=lambda *args, **kwargs: Client())
+        self.assertEqual(str(failure.exception), "mailbox_auth_failed")
+
     def test_receive_checks_latest_header_read_only_without_ingesting(self):
         calls = []
         class Client:
@@ -227,6 +245,17 @@ class MailReceiverTests(unittest.TestCase):
             receiver.poll_once()
         self.assertEqual(self.client.login_calls, 2)
         self.assertEqual(receiver.status()[0]["last_error"], "")
+
+    def test_password_change_clears_only_that_streams_auth_backoff(self):
+        self.client.fail_login = True
+        receiver = self.receiver()
+        receiver.poll_once()
+        self.assertEqual(receiver.status()[0]["last_error"], "mailbox_auth_failed")
+        replacement = replace(self.account, password="new-synthetic-secret")
+        receiver.replace_accounts([replacement])
+        status = receiver.status()[0]
+        self.assertEqual(status["last_error"], "")
+        self.assertEqual(status["next_retry_at"], 0)
         self.assertEqual(receiver.status()[0]["next_retry_at"], 0)
 
     def test_uidvalidity_change_fails_closed_without_replaying(self):

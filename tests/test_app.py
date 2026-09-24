@@ -22,6 +22,7 @@ from app import (
     parse_sim_info,
 )
 from central_auth import CentralAuthUnavailable
+from mail_receiver import MailboxLoginError
 
 
 WRITE_API_KEY = "a" * 64
@@ -234,6 +235,12 @@ class RelayApiTests(unittest.TestCase):
         self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))[0]["password"], "synthetic-secret")
         self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))[0]["username"], "work@example.test")
         self.assertEqual(len(self.server.mail_receiver.accounts), 1)
+        self.server.mail_receiver._update(self.server.mail_receiver.accounts[0],
+                                          last_error="mailbox_auth_failed", next_retry_at=123)
+        status, listed = self.request("GET", path, cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(listed["mailboxes"][0]["last_error"], "mailbox_auth_failed")
+        self.assertEqual(listed["mailboxes"][0]["next_retry_at"], 123)
         edit = {**payload, "password": "", "smtp_password": "", "smtp_port": 587,
                 "smtp_security": "starttls"}
         status, _ = self.request("PUT", path + "/work-a", edit, cookie=cookie, extra_headers=origin)
@@ -263,6 +270,11 @@ class RelayApiTests(unittest.TestCase):
                 self.assertEqual(status, 200)
             self.assertEqual(receive.call_count, 1)
             self.assertEqual(send.call_count, 1)
+            receive.side_effect = MailboxLoginError("mailbox_auth_failed")
+            status, body = self.request("POST", "/v1/mailboxes/config/work-a/test/receive",
+                                        cookie=cookie, extra_headers=origin)
+            self.assertEqual(status, 502)
+            self.assertEqual(body["error"], "mailbox_auth_failed")
             send.side_effect = ValueError("synthetic-secret provider detail")
             status, body = self.request("POST", "/v1/mailboxes/config/work-a/test/send",
                                         cookie=cookie, extra_headers=origin)

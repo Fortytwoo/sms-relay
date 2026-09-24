@@ -243,6 +243,8 @@ svg {
 .mail-account-heading strong { font-size: 18px; }
 .mail-account-heading span { color: var(--color-muted); font-size: 13px; }
 .mail-account-card p { margin: 10px 0 18px; color: var(--color-muted); overflow-wrap: anywhere; }
+.mail-account-card .mail-account-status { margin: -8px 0 18px; font-size: 13px; }
+.mail-account-card .mail-account-status.is-error { color: var(--color-danger); }
 .mail-account-actions, .mail-form-actions { display: flex; flex-wrap: wrap; gap: 10px; }
 .mail-account-actions .secondary-button:last-child { color: var(--color-danger); }
 .mail-account-actions button:disabled { opacity: .55; cursor: wait; }

@@ -216,6 +216,23 @@ function renderMailAccounts() {
     heading.append(title, id);
     const detail = document.createElement("p");
     detail.textContent = `IMAP ${account.host}:${account.port} · SMTP ${account.smtp_host ? `${account.smtp_host}:${account.smtp_port}` : "未配置"}`;
+    const sync = document.createElement("p");
+    sync.className = "mail-account-status";
+    if (account.last_error === "mailbox_auth_failed") {
+      sync.textContent = "收信登录被拒绝：请检查客户端访问权限和客户端专用密码";
+      sync.classList.add("is-error");
+    } else if (account.last_error === "uidvalidity_changed") {
+      sync.textContent = "邮箱文件夹标识已变化，请核对同步配置";
+      sync.classList.add("is-error");
+    } else if (account.last_error) {
+      sync.textContent = "收信同步异常，请测试收信连接";
+      sync.classList.add("is-error");
+    } else {
+      sync.textContent = account.last_success_at ? `上次收信同步：${fullDate(account.last_success_at)}` : "等待首次收信同步";
+    }
+    if (account.last_error && account.next_retry_at * 1000 > Date.now()) {
+      sync.textContent += ` · 将于 ${new Date(account.next_retry_at * 1000).toLocaleTimeString("zh-CN")} 自动重试`;
+    }
     const actions = document.createElement("div");
     actions.className = "mail-account-actions";
     for (const [label, action] of [["编辑", "edit"], ["测试收信", "receive"], ["测试发信", "send"], ["删除", "delete"]]) {
@@ -226,7 +243,7 @@ function renderMailAccounts() {
       button.addEventListener("click", () => mailAction(account, action, button));
       actions.append(button);
     }
-    card.append(heading, detail, actions);
+    card.append(heading, detail, sync, actions);
     elements.mailAccountList.append(card);
   }
 }
@@ -276,7 +293,15 @@ async function mailAction(account, action, button) {
       mailNotice(action === "receive" ? "收信测试成功：已只读检查收件箱" : "发信测试成功：测试邮件已发往本邮箱");
     }
   } catch (error) {
-    if (error.message !== "unauthorized") mailNotice(`${action === "delete" ? "删除" : "连通性测试"}失败：${error.message}`);
+    if (error.message !== "unauthorized") {
+      const reason = {
+        smtp_not_configured: "请先填写 SMTP 主机",
+        mailbox_auth_failed: "IMAP 登录被拒绝，请核对客户端访问权限和客户端专用密码",
+        imap_test_failed: "IMAP 连接或收件箱读取失败",
+        smtp_test_failed: "SMTP 连接、登录或发送失败",
+      }[error.message] || error.message;
+      mailNotice(`${action === "delete" ? "删除" : "连通性测试"}失败：${reason}`);
+    }
   } finally { button.disabled = false; }
 }
 
