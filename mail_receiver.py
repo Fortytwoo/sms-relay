@@ -7,6 +7,8 @@ import json
 import re
 import sqlite3
 import ssl
+import smtplib
+from email.message import EmailMessage
 import threading
 import time
 from contextlib import contextmanager
@@ -45,6 +47,11 @@ class MailAccount:
     port: int = 993
     folder: str = "INBOX"
     start_from: str = "latest"
+    smtp_host: str = ""
+    smtp_port: int = 465
+    smtp_security: str = "ssl"
+    smtp_username: str = ""
+    smtp_password: str = field(default="", repr=False)
 
     @property
     def state_key(self) -> str:
@@ -57,7 +64,17 @@ def load_accounts(path: str) -> list[MailAccount]:
     if not path:
         return []
     try:
-        records = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        file = Path(path)
+        if not file.exists():
+            return []
+        records = json.loads(file.read_text(encoding="utf-8-sig"))
+        return parse_accounts(records)
+    except (ValueError, TypeError, OSError):
+        raise ValueError("invalid mailbox configuration; see docs/EMAIL.md") from None
+
+
+def parse_accounts(records: object) -> list[MailAccount]:
+    try:
         if not isinstance(records, list) or len(records) > 100:
             raise ValueError
         accounts = []
@@ -67,7 +84,7 @@ def load_accounts(path: str) -> list[MailAccount]:
             if set(record) - set(MailAccount.__dataclass_fields__):
                 raise ValueError
             values = dict(record)
-            values.setdefault("username", values.get("address"))
+            values["username"] = values.get("username") or values.get("address")
             account = MailAccount(**values)
             if any(not isinstance(getattr(account, name), str) or not getattr(account, name)
                    for name in ("id", "address", "host", "username", "password", "folder")):
@@ -76,12 +93,18 @@ def load_accounts(path: str) -> list[MailAccount]:
                 raise ValueError
             if type(account.port) is not int or not 1 <= account.port <= 65535:
                 raise ValueError
+            if type(account.smtp_port) is not int or not 1 <= account.smtp_port <= 65535:
+                raise ValueError
+            if account.smtp_security not in {"ssl", "starttls"}:
+                raise ValueError
             if account.start_from not in {"latest", "all"}:
                 raise ValueError
             # Use ASCII IMAP folder names (modified UTF-7 for non-ASCII folders).
             if not account.folder.isascii() or any(c in account.folder for c in '\r\n"\\'):
                 raise ValueError
             if any(c in account.host + account.username for c in "\r\n"):
+                raise ValueError
+            if any(c in account.smtp_host + account.smtp_username for c in "\r\n"):
                 raise ValueError
             values["address"] = normalize_address(account.address)
             accounts.append(MailAccount(**values))
@@ -90,9 +113,59 @@ def load_accounts(path: str) -> list[MailAccount]:
         if len({a.address for a in accounts}) != len(accounts):
             raise ValueError
         return accounts
-    except (ValueError, TypeError, OSError):
+    except (ValueError, TypeError):
         # Do not include JSON decoder excerpts or paths containing credentials.
         raise ValueError("invalid mailbox configuration; see docs/EMAIL.md") from None
+
+
+def test_receive(account: MailAccount, *, client_factory=imaplib.IMAP4_SSL) -> None:
+    client = client_factory(account.host, account.port,
+                            ssl_context=ssl.create_default_context(), timeout=15)
+    try:
+        kind, _ = client.login(account.username, account.password)
+        if kind != "OK":
+            raise imaplib.IMAP4.error("login_failed")
+        kind, data = client.select('"' + account.folder + '"', readonly=True)
+        if kind != "OK":
+            raise imaplib.IMAP4.error("select_failed")
+        if data and data[0].isdigit() and int(data[0]) > 0:
+            kind, _ = client.fetch(data[0].decode("ascii"), "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])")
+            if kind != "OK":
+                raise imaplib.IMAP4.error("fetch_failed")
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+
+def test_send(account: MailAccount, *, ssl_factory=smtplib.SMTP_SSL,
+              starttls_factory=smtplib.SMTP) -> None:
+    if not account.smtp_host:
+        raise ValueError("smtp_not_configured")
+    context = ssl.create_default_context()
+    if account.smtp_security == "ssl":
+        client = ssl_factory(account.smtp_host, account.smtp_port, context=context, timeout=15)
+    else:
+        client = starttls_factory(account.smtp_host, account.smtp_port, timeout=15)
+    try:
+        if account.smtp_security == "starttls":
+            client.ehlo()
+            client.starttls(context=context)
+            client.ehlo()
+        client.login(account.smtp_username or account.username,
+                     account.smtp_password or account.password)
+        mail = EmailMessage()
+        mail["From"] = account.address
+        mail["To"] = account.address
+        mail["Subject"] = "SMS Relay mailbox connection test"
+        mail.set_content("This is a connection test sent from SMS Relay.")
+        client.send_message(mail)
+    finally:
+        try:
+            client.quit()
+        except Exception:
+            pass
 
 
 class _HTMLText(HTMLParser):
@@ -162,6 +235,7 @@ class MailReceiver:
                  *, client_factory=imaplib.IMAP4_SSL):
         self.db_path, self.accounts, self.ingest = db_path, accounts, ingest
         self.client_factory = client_factory
+        self.accounts_lock = threading.RLock()
         self.stop = threading.Event()
         self.thread: threading.Thread | None = None
         with _db(db_path) as connection:
@@ -182,7 +256,7 @@ class MailReceiver:
                                    (account.state_key,))
 
     def status(self) -> list[dict]:
-        with _db(self.db_path) as connection:
+        with self.accounts_lock, _db(self.db_path) as connection:
             return [{"id": a.id, "address": a.address,
                      **dict(connection.execute(
                          "SELECT last_success_at, last_error, skipped_count, next_retry_at FROM mailbox_state WHERE state_key = ?",
@@ -269,27 +343,40 @@ class MailReceiver:
                 pass
 
     def poll_once(self):
-        for index, account in enumerate(self.accounts):
+        for index, account in enumerate(list(self.accounts)):
             if self.stop.is_set():
                 return
-            with _db(self.db_path) as connection:
-                retry = connection.execute(
-                    "SELECT next_retry_at, consecutive_failures FROM mailbox_state WHERE state_key = ?",
-                    (account.state_key,),
-                ).fetchone()
-            if retry["next_retry_at"] > time.time():
-                continue
-            try:
-                self.poll_account(account)
-            except Exception as exc:
-                # Never expose provider exceptions: these may echo credentials or mail.
-                auth_failure = isinstance(exc, MailboxLoginError)
-                delay = min((300 if auth_failure else 30) * 2 ** min(retry["consecutive_failures"], 7), 3600)
-                self._update(account, last_error="mailbox_auth_failed" if auth_failure else "mailbox_sync_failed",
-                             next_retry_at=int(time.time()) + delay,
-                             consecutive_failures=retry["consecutive_failures"] + 1)
+            with self.accounts_lock:
+                if account not in self.accounts:
+                    continue
+                self._poll_one(account)
             if index + 1 < len(self.accounts):
                 self.stop.wait(5)
+
+    def _poll_one(self, account):
+        with _db(self.db_path) as connection:
+            retry = connection.execute(
+                "SELECT next_retry_at, consecutive_failures FROM mailbox_state WHERE state_key = ?",
+                (account.state_key,),
+            ).fetchone()
+        if retry["next_retry_at"] > time.time():
+            return
+        try:
+            self.poll_account(account)
+        except Exception as exc:
+            # Never expose provider exceptions: these may echo credentials or mail.
+            auth_failure = isinstance(exc, MailboxLoginError)
+            delay = min((300 if auth_failure else 30) * 2 ** min(retry["consecutive_failures"], 7), 3600)
+            self._update(account, last_error="mailbox_auth_failed" if auth_failure else "mailbox_sync_failed",
+                         next_retry_at=int(time.time()) + delay,
+                         consecutive_failures=retry["consecutive_failures"] + 1)
+
+    def replace_accounts(self, accounts: list[MailAccount]):
+        with self.accounts_lock, _db(self.db_path) as connection:
+            for account in accounts:
+                connection.execute("INSERT OR IGNORE INTO mailbox_state(state_key) VALUES (?)",
+                                   (account.state_key,))
+            self.accounts = list(accounts)
 
     def _loop(self):
         while not self.stop.is_set():

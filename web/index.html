@@ -6,7 +6,7 @@
   <meta name="color-scheme" content="light">
   <meta name="theme-color" content="#ffffff">
   <title>短信中转</title>
-  <link rel="stylesheet" href="assets/app.css?v=1.4.0">
+  <link rel="stylesheet" href="assets/app.css?v=1.5.1">
 </head>
 <body class="is-auth-view">
   <div class="site-shell">
@@ -15,6 +15,7 @@
         <div class="brand">短信中转</div>
         <nav class="main-nav" id="main-nav" aria-label="主导航" hidden>
           <button class="nav-button is-active" id="inbox-nav" type="button">收件箱</button>
+          <button class="nav-button" id="mail-settings-nav" type="button">邮箱配置</button>
         </nav>
       </div>
       <div class="topbar-actions" id="topbar-actions" hidden>
@@ -207,8 +208,42 @@
       </section>
     </main>
 
+    <main class="mail-settings-view" id="mail-settings-view" hidden>
+      <div class="mail-settings-shell">
+        <div class="mail-settings-heading">
+          <div><h1>邮箱配置</h1><p>管理收信邮箱，并分别测试 IMAP 收信和 SMTP 发信。</p></div>
+          <button class="secondary-button" id="mail-add" type="button">添加邮箱</button>
+        </div>
+        <p class="mail-settings-notice" id="mail-settings-notice" role="status" hidden></p>
+        <div class="mail-account-list" id="mail-account-list"></div>
+        <section class="mail-editor" id="mail-editor" aria-labelledby="mail-editor-title" hidden>
+          <h2 id="mail-editor-title">添加邮箱</h2>
+          <form id="mail-form">
+            <div class="mail-form-grid">
+              <label>标识 ID<input name="id" required maxlength="64" pattern="[A-Za-z0-9_-]+" autocomplete="off"></label>
+              <label>邮箱地址<input name="address" type="email" required maxlength="320" autocomplete="off"></label>
+              <label>IMAP 主机<input name="host" required value="imap.exmail.qq.com" autocomplete="off"></label>
+              <label>IMAP 端口<input name="port" type="number" min="1" max="65535" required value="993"></label>
+              <label>IMAP 用户名<input name="username" placeholder="默认使用邮箱地址" autocomplete="off"></label>
+              <label>邮箱密码 / 客户端密码<input name="password" type="password" autocomplete="new-password" placeholder="编辑时留空表示不更换"></label>
+              <label>收件文件夹<input name="folder" required value="INBOX"></label>
+              <label>首次同步<select name="start_from"><option value="latest">仅接收新增邮件</option><option value="all">读取历史邮件并可能通知</option></select></label>
+              <label>SMTP 主机<input name="smtp_host" placeholder="填写邮箱服务商提供的 SMTP 地址" autocomplete="off"></label>
+              <label>SMTP 端口<input name="smtp_port" type="number" min="1" max="65535" required value="465"></label>
+              <label>SMTP 安全连接<select name="smtp_security"><option value="ssl">SSL/TLS</option><option value="starttls">STARTTLS</option></select></label>
+              <label>SMTP 用户名<input name="smtp_username" placeholder="默认使用 IMAP 用户名" autocomplete="off"></label>
+              <label>SMTP 密码<input name="smtp_password" type="password" autocomplete="new-password" placeholder="默认使用邮箱密码；编辑时留空不更换"></label>
+            </div>
+            <p class="mail-form-hint">凭据仅保存在服务端。发信测试会向此邮箱发送一封测试邮件。</p>
+            <p class="form-error" id="mail-form-error" role="alert" hidden></p>
+            <div class="mail-form-actions"><button class="primary-button" id="mail-save" type="submit">保存配置</button><button class="secondary-button" id="mail-cancel" type="button">取消</button></div>
+          </form>
+        </section>
+      </div>
+    </main>
+
   </div>
   <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
-  <script src="assets/app.js?v=1.4.0" defer></script>
+  <script src="assets/app.js?v=1.5.0" defer></script>
 </body>
 </html>

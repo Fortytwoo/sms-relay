@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import FeishuNotifier, RelayServer, enrich_message, fingerprint, init_db, open_db, parse_message
-from mail_receiver import MAX_MAIL_BYTES, MailAccount, MailReceiver, load_accounts, parse_email
+from mail_receiver import MAX_MAIL_BYTES, MailAccount, MailReceiver, load_accounts, parse_email, test_receive, test_send
 from test_app import FakeCentralAuth
 
 
@@ -74,6 +74,52 @@ class FakeIMAP:
 
     def logout(self):
         self.closed = True
+
+
+class MailConnectionTests(unittest.TestCase):
+    def test_receive_checks_latest_header_read_only_without_ingesting(self):
+        calls = []
+        class Client:
+            def login(self, username, password):
+                calls.append(("login", username, password))
+                return "OK", []
+            def select(self, folder, readonly=False):
+                calls.append(("select", folder, readonly))
+                return "OK", [b"2"]
+            def fetch(self, number, query):
+                calls.append(("fetch", number, query))
+                return "OK", []
+            def logout(self):
+                calls.append(("logout",))
+        account = MailAccount("a", "a@example.test", "imap.example.test", "a@example.test", "secret")
+        def factory(host, port, *, ssl_context, timeout):
+            self.assertTrue(ssl_context.check_hostname)
+            self.assertEqual(ssl_context.verify_mode, ssl.CERT_REQUIRED)
+            return Client()
+        test_receive(account, client_factory=factory)
+        self.assertIn(("select", '"INBOX"', True), calls)
+        self.assertIn(("fetch", "2", "(BODY.PEEK[HEADER.FIELDS (SUBJECT)])"), calls)
+        self.assertEqual(calls[-1], ("logout",))
+
+    def test_send_uses_tls_and_addresses_mail_to_self(self):
+        calls = []
+        class Client:
+            def login(self, username, password):
+                calls.append(("login", username, password))
+            def send_message(self, message):
+                calls.append(("send", message["From"], message["To"]))
+            def quit(self):
+                calls.append(("quit",))
+        account = MailAccount("a", "a@example.test", "imap.example.test", "a@example.test", "secret",
+                              smtp_host="smtp.example.test")
+        def factory(host, port, *, context, timeout):
+            self.assertEqual((host, port, timeout), ("smtp.example.test", 465, 15))
+            self.assertTrue(context.check_hostname)
+            return Client()
+        test_send(account, ssl_factory=factory)
+        self.assertIn(("login", "a@example.test", "secret"), calls)
+        self.assertIn(("send", "a@example.test", "a@example.test"), calls)
+        self.assertEqual(calls[-1], ("quit",))
 
 
 class MailReceiverTests(unittest.TestCase):

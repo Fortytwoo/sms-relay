@@ -9,6 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 from app import (
     FeishuNotifier,
@@ -211,6 +212,63 @@ class RelayApiTests(unittest.TestCase):
             body,
             {"ok": True, "status": "healthy"},
         )
+
+    def test_mailbox_configuration_requires_session_and_origin_and_redacts_secrets(self) -> None:
+        path = "/v1/mailboxes/config"
+        origin = {"Origin": self.base_url}
+        payload = {"id": "work-a", "address": "work@example.test", "host": "imap.example.test",
+                   "username": "", "password": "synthetic-secret", "smtp_host": "smtp.example.test"}
+        self.assertEqual(self.request("GET", path, api_key=READ_API_KEY)[0], 401)
+        self.assertEqual(self.request("POST", path, payload, api_key=WRITE_API_KEY,
+                                      extra_headers=origin)[0], 401)
+        cookie, _ = self.login()
+        self.assertEqual(self.request("POST", path, payload, cookie=cookie)[0], 403)
+        self.assertEqual(self.request("POST", path, payload, cookie=cookie,
+                                      extra_headers={"Origin": "https://evil.example.test"})[0], 403)
+        with patch("mail_receiver.MailReceiver.start"):
+            status, body = self.request("POST", path, payload, cookie=cookie, extra_headers=origin)
+        self.assertEqual(status, 200)
+        self.assertNotIn("synthetic-secret", json.dumps(body))
+        self.assertTrue(body["mailboxes"][0]["password_set"])
+        config_path = Path(self.db_path).with_name("mailboxes.json")
+        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))[0]["password"], "synthetic-secret")
+        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8"))[0]["username"], "work@example.test")
+        self.assertEqual(len(self.server.mail_receiver.accounts), 1)
+        edit = {**payload, "password": "", "smtp_password": "", "smtp_port": 587,
+                "smtp_security": "starttls"}
+        status, _ = self.request("PUT", path + "/work-a", edit, cookie=cookie, extra_headers=origin)
+        self.assertEqual(status, 200)
+        saved = json.loads(config_path.read_text(encoding="utf-8"))[0]
+        self.assertEqual(saved["password"], "synthetic-secret")
+        self.assertEqual(saved["smtp_port"], 587)
+        self.assertEqual(self.request("POST", path, {**payload, "id": "work-b", "address": payload["address"]},
+                                      cookie=cookie, extra_headers=origin)[0], 400)
+        self.assertEqual(self.request("DELETE", path + "/work-a", cookie=cookie,
+                                      extra_headers=origin)[0], 200)
+        self.assertEqual(json.loads(config_path.read_text(encoding="utf-8")), [])
+        self.assertEqual(self.server.mail_receiver.accounts, [])
+
+    def test_mailbox_connection_tests_use_saved_account_and_sanitize_failures(self) -> None:
+        cookie, _ = self.login()
+        origin = {"Origin": self.base_url}
+        payload = {"id": "work-a", "address": "work@example.test", "host": "imap.example.test",
+                   "password": "synthetic-secret", "smtp_host": "smtp.example.test"}
+        with patch("mail_receiver.MailReceiver.start"):
+            self.assertEqual(self.request("POST", "/v1/mailboxes/config", payload,
+                                          cookie=cookie, extra_headers=origin)[0], 200)
+        with patch("mail_receiver.test_receive") as receive, patch("mail_receiver.test_send") as send:
+            for mode in ("receive", "send"):
+                status, _ = self.request("POST", f"/v1/mailboxes/config/work-a/test/{mode}",
+                                         cookie=cookie, extra_headers=origin)
+                self.assertEqual(status, 200)
+            self.assertEqual(receive.call_count, 1)
+            self.assertEqual(send.call_count, 1)
+            send.side_effect = ValueError("synthetic-secret provider detail")
+            status, body = self.request("POST", "/v1/mailboxes/config/work-a/test/send",
+                                        cookie=cookie, extra_headers=origin)
+            self.assertEqual(status, 502)
+            self.assertEqual(body["error"], "smtp_test_failed")
+            self.assertNotIn("synthetic-secret", json.dumps(body))
 
     def test_web_ui_and_assets_are_public_with_security_headers(self) -> None:
         status, page, headers = self.request_text("/")

@@ -15,6 +15,17 @@ const state = {
 const elements = {
   loginView: document.querySelector("#login-view"),
   inboxView: document.querySelector("#inbox-view"),
+  mailSettingsView: document.querySelector("#mail-settings-view"),
+  mailSettingsNav: document.querySelector("#mail-settings-nav"),
+  mailAdd: document.querySelector("#mail-add"),
+  mailAccountList: document.querySelector("#mail-account-list"),
+  mailEditor: document.querySelector("#mail-editor"),
+  mailEditorTitle: document.querySelector("#mail-editor-title"),
+  mailForm: document.querySelector("#mail-form"),
+  mailSave: document.querySelector("#mail-save"),
+  mailCancel: document.querySelector("#mail-cancel"),
+  mailFormError: document.querySelector("#mail-form-error"),
+  mailSettingsNotice: document.querySelector("#mail-settings-notice"),
   mainNav: document.querySelector("#main-nav"),
   inboxNav: document.querySelector("#inbox-nav"),
   topbarActions: document.querySelector("#topbar-actions"),
@@ -127,6 +138,7 @@ function showLogin(message = "") {
   document.body.classList.remove("detail-open");
   document.body.classList.add("is-auth-view");
   elements.inboxView.hidden = true;
+  elements.mailSettingsView.hidden = true;
   elements.mainNav.hidden = true;
   elements.topbarActions.hidden = true;
   elements.loginView.hidden = false;
@@ -143,9 +155,161 @@ function showInbox(user) {
   elements.mainNav.hidden = false;
   elements.topbarActions.hidden = false;
   elements.inboxView.hidden = false;
+  elements.mailSettingsView.hidden = true;
+  elements.inboxNav.classList.add("is-active");
+  elements.mailSettingsNav.classList.remove("is-active");
   startAutoRefresh();
   if (!state.messages.length) fetchMessages();
 }
+
+const mailState = { accounts: [], editingId: null };
+
+function mailNotice(message = "") {
+  elements.mailSettingsNotice.textContent = message;
+  elements.mailSettingsNotice.hidden = !message;
+}
+
+function mailError(message = "") {
+  elements.mailFormError.textContent = message;
+  elements.mailFormError.hidden = !message;
+}
+
+function showMailSettings() {
+  stopAutoRefresh();
+  elements.inboxView.hidden = true;
+  elements.mailSettingsView.hidden = false;
+  elements.inboxNav.classList.remove("is-active");
+  elements.mailSettingsNav.classList.add("is-active");
+  loadMailAccounts();
+}
+
+async function mailRequest(path, options = {}) {
+  const response = await fetch(relativeUrl(path), { cache: "no-store", ...options });
+  let body = {};
+  try { body = await response.json(); } catch { /* Keep a generic error below. */ }
+  if (response.status === 401) {
+    showLogin("登录已过期，请重新通过统一认证登录");
+    throw new Error("unauthorized");
+  }
+  if (!response.ok) throw new Error(body.error || `http_${response.status}`);
+  return body;
+}
+
+function renderMailAccounts() {
+  elements.mailAccountList.replaceChildren();
+  if (!mailState.accounts.length) {
+    const empty = document.createElement("p");
+    empty.className = "mail-empty";
+    empty.textContent = "尚未配置邮箱。点击“添加邮箱”开始。";
+    elements.mailAccountList.append(empty);
+    return;
+  }
+  for (const account of mailState.accounts) {
+    const card = document.createElement("article");
+    card.className = "mail-account-card";
+    const heading = document.createElement("div");
+    heading.className = "mail-account-heading";
+    const title = document.createElement("strong");
+    title.textContent = account.address;
+    const id = document.createElement("span");
+    id.textContent = account.id;
+    heading.append(title, id);
+    const detail = document.createElement("p");
+    detail.textContent = `IMAP ${account.host}:${account.port} · SMTP ${account.smtp_host ? `${account.smtp_host}:${account.smtp_port}` : "未配置"}`;
+    const actions = document.createElement("div");
+    actions.className = "mail-account-actions";
+    for (const [label, action] of [["编辑", "edit"], ["测试收信", "receive"], ["测试发信", "send"], ["删除", "delete"]]) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "secondary-button";
+      button.textContent = label;
+      button.addEventListener("click", () => mailAction(account, action, button));
+      actions.append(button);
+    }
+    card.append(heading, detail, actions);
+    elements.mailAccountList.append(card);
+  }
+}
+
+async function loadMailAccounts() {
+  try {
+    const body = await mailRequest("v1/mailboxes/config");
+    mailState.accounts = body.mailboxes || [];
+    renderMailAccounts();
+    mailNotice();
+  } catch (error) {
+    if (error.message !== "unauthorized") mailNotice("邮箱配置读取失败，请稍后重试");
+  }
+}
+
+function openMailEditor(account = null) {
+  mailState.editingId = account?.id || null;
+  elements.mailForm.reset();
+  elements.mailForm.elements.id.disabled = !!account;
+  if (account) {
+    for (const [name, value] of Object.entries(account)) {
+      if (elements.mailForm.elements[name] && name !== "password" && name !== "smtp_password") {
+        elements.mailForm.elements[name].value = value;
+      }
+    }
+  }
+  elements.mailEditorTitle.textContent = account ? `编辑 ${account.address}` : "添加邮箱";
+  elements.mailEditor.hidden = false;
+  mailError();
+  elements.mailEditor.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function mailAction(account, action, button) {
+  if (action === "edit") { openMailEditor(account); return; }
+  if (action === "delete" && !window.confirm(`确定删除 ${account.address} 的邮箱配置？已接收邮件仍会保留。`)) return;
+  button.disabled = true;
+  mailNotice(action === "receive" ? "正在测试收信…" : action === "send" ? "正在发送测试邮件…" : "正在删除…");
+  try {
+    const base = `v1/mailboxes/config/${encodeURIComponent(account.id)}`;
+    if (action === "delete") {
+      await mailRequest(base, { method: "DELETE" });
+      if (mailState.editingId === account.id) elements.mailEditor.hidden = true;
+      await loadMailAccounts();
+      mailNotice("邮箱配置已删除");
+    } else {
+      await mailRequest(`${base}/test/${action}`, { method: "POST" });
+      mailNotice(action === "receive" ? "收信测试成功：已只读检查收件箱" : "发信测试成功：测试邮件已发往本邮箱");
+    }
+  } catch (error) {
+    if (error.message !== "unauthorized") mailNotice(`${action === "delete" ? "删除" : "连通性测试"}失败：${error.message}`);
+  } finally { button.disabled = false; }
+}
+
+elements.mailSettingsNav.addEventListener("click", showMailSettings);
+elements.inboxNav.addEventListener("click", () => {
+  elements.mailSettingsView.hidden = true;
+  elements.inboxView.hidden = false;
+  elements.mailSettingsNav.classList.remove("is-active");
+  elements.inboxNav.classList.add("is-active");
+  startAutoRefresh();
+  fetchMessages({ quiet: true });
+});
+elements.mailAdd.addEventListener("click", () => openMailEditor());
+elements.mailCancel.addEventListener("click", () => { elements.mailEditor.hidden = true; mailError(); });
+elements.mailForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  mailError();
+  const data = Object.fromEntries(new FormData(elements.mailForm));
+  data.id = mailState.editingId || data.id;
+  data.port = Number(data.port);
+  data.smtp_port = Number(data.smtp_port);
+  elements.mailSave.disabled = true;
+  try {
+    const path = mailState.editingId ? `v1/mailboxes/config/${encodeURIComponent(mailState.editingId)}` : "v1/mailboxes/config";
+    await mailRequest(path, { method: mailState.editingId ? "PUT" : "POST",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+    elements.mailEditor.hidden = true;
+    await loadMailAccounts();
+    mailNotice("邮箱配置已保存，收信线程已更新");
+  } catch (error) {
+    if (error.message !== "unauthorized") mailError(`保存失败：${error.message}`);
+  } finally { elements.mailSave.disabled = false; }
+});
 
 function normalizeDate(value) {
   if (!value) return null;

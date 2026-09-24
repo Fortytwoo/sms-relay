@@ -678,6 +678,8 @@ class RelayServer(ThreadingHTTPServer):
         self.notification_event = threading.Event()
         self.notification_thread: threading.Thread | None = None
         self.mail_receiver = None
+        from mailbox_config import MailboxConfig, default_config_path
+        self.mailbox_config = MailboxConfig(default_config_path(db_path), [])
         init_db(db_path)
         super().__init__(address, RelayHandler)
         if self.notifier is not None:
@@ -1101,6 +1103,15 @@ class RelayServer(ThreadingHTTPServer):
             self.notification_thread.join(timeout=2)
         super().server_close()
 
+    def set_mail_accounts(self, accounts) -> None:
+        from mail_receiver import MailReceiver
+        if self.mail_receiver is None:
+            if accounts:
+                self.mail_receiver = MailReceiver(self.db_path, accounts, self.ingest_message)
+                self.mail_receiver.start()
+        else:
+            self.mail_receiver.replace_accounts(accounts)
+
 
 class RelayHandler(BaseHTTPRequestHandler):
     server: RelayServer
@@ -1226,6 +1237,60 @@ class RelayHandler(BaseHTTPRequestHandler):
             return True
         self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
         return False
+
+    def require_mailbox_auth(self, *, mutation: bool = False) -> bool:
+        try:
+            user = self.session_user()
+        except CentralAuthUnavailable:
+            self.send_json(HTTPStatus.SERVICE_UNAVAILABLE,
+                           {"ok": False, "error": "authorization_service_unavailable"})
+            return False
+        if user is None:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"ok": False, "error": "unauthorized"})
+            return False
+        if mutation:
+            origin = urlsplit(self.headers.get("Origin", ""))
+            scheme = self.headers.get("X-Forwarded-Proto", "http")
+            if origin.scheme != scheme or origin.netloc != self.headers.get("Host", ""):
+                self.send_json(HTTPStatus.FORBIDDEN, {"ok": False, "error": "invalid_origin"})
+                return False
+        return True
+
+    def mailbox_body(self) -> object | None:
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            self.send_json(HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+                           {"ok": False, "error": "content_type_must_be_application_json"})
+            return None
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if not 0 < length <= MAX_BODY_BYTES:
+                raise ValueError
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except (ValueError, UnicodeError, json.JSONDecodeError):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "invalid_body"})
+            return None
+
+    def mailbox_save(self, original_id: str | None = None) -> None:
+        if not self.require_mailbox_auth(mutation=True):
+            return
+        body = self.mailbox_body()
+        if body is None:
+            return
+        try:
+            with self.server.mailbox_config.lock:
+                accounts = self.server.mailbox_config.save(body, original_id=original_id)
+                self.server.set_mail_accounts(accounts)
+        except KeyError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return
+        except ValueError as exc:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": str(exc)})
+            return
+        except OSError:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                           {"ok": False, "error": "mailbox_save_failed"})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True, "mailboxes": self.server.mailbox_config.list_public()})
 
     def handle_oauth_login(self) -> None:
         state, verifier, browser_binding = self.server.create_oauth_transaction()
@@ -1430,6 +1495,12 @@ class RelayHandler(BaseHTTPRequestHandler):
             accounts = self.server.mail_receiver.status() if self.server.mail_receiver else []
             self.send_json(HTTPStatus.OK, {"ok": True, "mailboxes": accounts})
             return
+        if parsed.path == "/v1/mailboxes/config":
+            if not self.require_mailbox_auth():
+                return
+            self.send_json(HTTPStatus.OK, {"ok": True,
+                           "mailboxes": self.server.mailbox_config.list_public()})
+            return
         if parsed.path != "/v1/messages":
             self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
             return
@@ -1498,6 +1569,29 @@ class RelayHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlsplit(self.path)
+        if parsed.path == "/v1/mailboxes/config":
+            self.mailbox_save()
+            return
+        test_match = re.fullmatch(r"/v1/mailboxes/config/([A-Za-z0-9_-]{1,64})/test/(send|receive)", parsed.path)
+        if test_match:
+            if not self.require_mailbox_auth(mutation=True):
+                return
+            account = self.server.mailbox_config.get(test_match[1])
+            if account is None:
+                self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+                return
+            if test_match[2] == "send" and not account.smtp_host:
+                self.send_json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "smtp_not_configured"})
+                return
+            from mail_receiver import test_receive, test_send
+            try:
+                (test_send if test_match[2] == "send" else test_receive)(account)
+            except Exception:
+                self.send_json(HTTPStatus.BAD_GATEWAY,
+                               {"ok": False, "error": "smtp_test_failed" if test_match[2] == "send" else "imap_test_failed"})
+                return
+            self.send_json(HTTPStatus.OK, {"ok": True})
+            return
         if parsed.path == "/auth/logout":
             try:
                 self.server.logout_session(self.headers.get("Cookie", ""))
@@ -1549,16 +1643,42 @@ class RelayHandler(BaseHTTPRequestHandler):
         self.send_json(HTTPStatus.OK, self.server.ingest_message(message, source_ip))
 
     def do_PUT(self) -> None:  # noqa: N802
+        match = re.fullmatch(r"/v1/mailboxes/config/([A-Za-z0-9_-]{1,64})", urlsplit(self.path).path)
+        if match:
+            self.mailbox_save(match[1])
+            return
         self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        match = re.fullmatch(r"/v1/mailboxes/config/([A-Za-z0-9_-]{1,64})", urlsplit(self.path).path)
+        if not match:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return
+        if not self.require_mailbox_auth(mutation=True):
+            return
+        try:
+            with self.server.mailbox_config.lock:
+                accounts = self.server.mailbox_config.delete(match[1])
+                self.server.set_mail_accounts(accounts)
+        except KeyError:
+            self.send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "not_found"})
+            return
+        except OSError:
+            self.send_json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                           {"ok": False, "error": "mailbox_save_failed"})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True})
 
 
 def main() -> None:
-    from mail_receiver import MailReceiver, load_accounts
+    from mail_receiver import load_accounts
+    from mailbox_config import MailboxConfig, default_config_path
 
-    accounts = load_accounts(os.environ.get("SMS_RELAY_MAILBOXES_FILE", ""))
     api_key = os.environ.get("SMS_RELAY_API_KEY", "")
     read_api_key = os.environ.get("SMS_RELAY_READ_API_KEY", "")
     db_path = os.environ.get("SMS_RELAY_DB_PATH", "/data/sms-relay.db")
+    mailbox_path = os.environ.get("SMS_RELAY_MAILBOXES_FILE") or default_config_path(db_path)
+    accounts = load_accounts(mailbox_path)
     host = os.environ.get("SMS_RELAY_HOST", "0.0.0.0")
     port = int(os.environ.get("SMS_RELAY_PORT", "8000"))
     feishu_app_id = os.environ.get("FEISHU_APP_ID", "")
@@ -1608,6 +1728,7 @@ def main() -> None:
             os.environ.get("AUTH_INTROSPECTION_CACHE_SECONDS", "5")
         ),
     )
+    server.mailbox_config = MailboxConfig(mailbox_path, accounts)
     print(
         json.dumps(
             {
@@ -1626,8 +1747,7 @@ def main() -> None:
     )
     try:
         if accounts:
-            server.mail_receiver = MailReceiver(server.db_path, accounts, server.ingest_message)
-            server.mail_receiver.start()
+            server.set_mail_accounts(accounts)
         server.serve_forever()
     except KeyboardInterrupt:
         pass

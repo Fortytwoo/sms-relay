@@ -6,7 +6,7 @@
 
 腾讯企业邮箱使用 `imap.exmail.qq.com:993`（SSL/TLS），用户名为完整邮箱地址。`password` 填邮箱密码；开启安全登录时需使用**客户端专用密码**。账号需允许 IMAP 登录。参见[腾讯云客户端说明](https://main.qcloudimg.com/raw/document/product/pdf/613_46019_cn.pdf)。
 
-复制 `mailboxes.example.json` 到 `data/mailboxes.json`，填入各邮箱凭据；`data/` 已被 Git 忽略。不要修改示例文件来保存真实凭据。
+可在网页登录后进入“邮箱配置”页面添加多个邮箱；配置会原子写入 `data/mailboxes.json`，保存后立即更新收信线程。也可复制 `mailboxes.example.json` 到该路径手工编辑；`data/` 已被 Git 忽略。不要修改示例文件来保存真实凭据。
 
 ```json
 [
@@ -35,6 +35,11 @@
 | `port` | 可选，默认 `993`；始终使用 TLS 并验证证书和 hostname |
 | `folder` | 可选，默认 `INBOX`；非 ASCII 文件夹使用 IMAP modified UTF-7 名称 |
 | `start_from` | 默认 `latest`：首次成功连接建立游标，只收后续新邮件；`all`：首次读取历史邮件，**也会触发历史验证码通知** |
+| `smtp_host` | 可选，SMTP 主机；填写后可测试发信 |
+| `smtp_port` | 默认 `465` |
+| `smtp_security` | `ssl`（默认）或 `starttls`；始终验证 TLS 证书与主机名 |
+| `smtp_username` | 可选，默认使用 IMAP 用户名 |
+| `smtp_password` | 可选，默认使用 IMAP 密码；编辑时留空保留原值 |
 
 Docker 的 `.env` 设置容器内路径，现有 `./data:/data` 挂载可直接读取：
 
@@ -42,7 +47,7 @@ Docker 的 `.env` 设置容器内路径，现有 `./data:/data` 挂载可直接�
 SMS_RELAY_MAILBOXES_FILE=/data/mailboxes.json
 ```
 
-文件需允许容器用户 `10001:10001` 读取，限制其他用户读取；Linux 可将文件 owner 设置为该用户，权限设为 `600`。留空此变量则完全关闭邮箱采集。账号增删或密码更新后重启目标服务生效，游标保存在 SQLite。生产变更仍按仓库的备份和部署规则执行。
+未设置此变量时默认使用与 SQLite 同目录的 `mailboxes.json`（容器内为 `/data/mailboxes.json`）。目录需允许容器用户 `10001:10001` 创建/替换文件；文件限制其他用户读取，Linux 权限建议 `600`。网页保存会以 `600` 权限原子替换文件，无需重启；手工编辑文件后仍需重启。游标保存在 SQLite。生产变更仍按仓库的备份和部署规则执行。
 
 本地运行使用本机路径（另需 README 中原有 Key/OAuth 配置）：
 
@@ -65,6 +70,12 @@ uv run python app.py
 - `UIDVALIDITY` 改变时暂停该账号并显示 `uidvalidity_changed`，避免静默重放历史验证码。核实远端文件夹重建后，可更换该账号 `id` 并保留 `start_from=latest`，重启建立新游标；如需补取重建期间邮件，可明确选择 `all`，注意历史通知和新 UID 可能造成重复。
 
 ## 网页与 API
+
+### 邮箱配置与连通性测试
+
+网页登录后进入“邮箱配置”，可新增、编辑、删除最多 100 个邮箱。配置接口仅接受中央 OAuth 会话，读写 API Key 均不能管理邮箱；跨来源写入会被拒绝。列表和编辑接口不返回密码，只显示是否已设置；编辑时密码留空表示沿用原值。删除配置不会删除已入库邮件或历史游标。
+
+每个邮箱可分别点击“测试收信”和“测试发信”：收信测试以只读模式登录 IMAP，读取收件箱最新邮件的主题头（空收件箱则只验证打开文件夹），不改变同步游标或已读状态；发信测试通过 SMTP 向该邮箱自身发送一封固定测试邮件。测试失败仅返回归类错误，不回显服务商响应或凭据。发信测试成功表示 SMTP 接受了邮件，不保证邮件最终送达；可随后查看收件箱或运行收信测试。真实邮件服务连通性需在配置凭据后验收。
 
 ### 邮件验证码与飞书卡片
 
